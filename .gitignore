@@ -1,0 +1,6 @@
+composer.lock
+composer.phar
+config.php
+contracts.json
+database_dump.sql
+vendor/

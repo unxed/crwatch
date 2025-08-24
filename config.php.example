@@ -1,0 +1,15 @@
+<?php
+// config.php
+
+// Настройки для подключения к вашей базе данных MySQL
+define('DB_HOST', '127.0.0.1');
+define('DB_NAME', 'database'); // !!! Замените на своё значение
+define('DB_USER', 'username'); // !!! Замените на своё значение
+define('DB_PASS', 'password');  // !!! Замените на своё значение
+
+// Настройки для Telegram-бота
+define('BOT_TOKEN', '1234567890:AAAAAAAAAAA-BBBBBBBBBBBBBBB_CCCCCCC'); // !!! Замените на токен, выданный @BotFather
+
+// Названия файлов
+define('LOG_FILE', 'bot.log');
+define('MIGRATE_LOG_FILE', 'migration.log');

@@ -3,6 +3,7 @@
 require 'vendor/autoload.php';
 
 use Symfony\Component\DomCrawler\Crawler;
+use Symfony\Component\DomCrawler\Crawler as DomCrawler;
 
 // =============================================================================
 // КОНФИГУРАЦИЯ
@@ -43,9 +44,6 @@ function displayProgressBar(int $current, int $total): void
     printf("\rПрогресс: [%s] %d/%d (%.2f%%)", $bar, $current, $total, $progress * 100);
 }
 
-/**
- * Извлекает номер аукциона из строки.
- */
 function extractAuctionNumber(string $details): ?string
 {
     if (preg_match('/№\s*(\d+)$/', $details, $matches)) {
@@ -55,34 +53,72 @@ function extractAuctionNumber(string $details): ?string
 }
 
 /**
- * Парсит страницу с детальной информацией об аукционе.
+ * Рекурсивно извлекает текст, сохраняя переносы от <br>.
+ */
+function getNodeTextWithNewlines(DomCrawler $crawlerNode): string
+{
+    if ($crawlerNode->count() === 0) {
+        return '';
+    }
+
+    $text = '';
+    // Используем нативный DOMNodeList и цикл foreach
+    foreach ($crawlerNode->getNode(0)->childNodes as $node) {
+        if ($node->nodeName === 'br') {
+            $text .= "\n"; // Добавляем реальный перенос строки
+        } elseif ($node->nodeType === XML_TEXT_NODE) {
+            // Добавляем текстовое содержимое как есть, со всеми пробелами
+            $text .= $node->nodeValue;
+        } elseif ($node->nodeType === XML_ELEMENT_NODE) {
+            // Для других тегов (например, <a> или <span>) рекурсивно вызываем функцию
+            $text .= getNodeTextWithNewlines(new DomCrawler($node));
+        }
+    }
+
+    // Умная многошаговая очистка:
+    // 1. Заменяем множественные пробелы и табы на один пробел.
+    $cleanedText = preg_replace('/[ \t]+/', ' ', $text);
+    // 2. Разбиваем по переносам строк.
+    $lines = explode("\n", $cleanedText);
+    // 3. Обрезаем пробелы у каждой строки.
+    $trimmedLines = array_map('trim', $lines);
+    // 4. Удаляем пустые строки, которые могли образоваться.
+    $nonEmptyLines = array_filter($trimmedLines);
+    // 5. Собираем обратно с правильными переносами.
+    return implode("\n", $nonEmptyLines);
+}
+
+
+/**
+ * Обновленная функция парсинга, использующая getNodeTextWithNewlines.
  */
 function parseAuctionPage(string $htmlContent): array
 {
-    $crawler = new Crawler($htmlContent);
+    $crawler = new DomCrawler($htmlContent);
     $enrichedData = [];
 
-    // Блок с основной информацией
     $mainInfoNode = $crawler->filter('.cardMainInfo');
     if ($mainInfoNode->count() > 0) {
         $enrichedData['procurement_main_info'] = [
             'status' => $mainInfoNode->filter('.cardMainInfo__state')->count() ? trim($mainInfoNode->filter('.cardMainInfo__state')->text()) : null,
-            'object' => $mainInfoNode->filter('.cardMainInfo__section .cardMainInfo__content')->eq(0)->text(),
+            'object' => getNodeTextWithNewlines($mainInfoNode->filter('.cardMainInfo__section .cardMainInfo__content')->eq(0)),
             'initial_price' => $mainInfoNode->filter('.cost')->count() ? trim($mainInfoNode->filter('.cost')->text()) : null,
             'published_date' => $mainInfoNode->filter('.date .cardMainInfo__content')->eq(0)->text(),
             'updated_date' => $mainInfoNode->filter('.date .cardMainInfo__content')->eq(1)->text(),
             'end_date' => $mainInfoNode->filter('.date .cardMainInfo__content')->eq(2)->text(),
         ];
     }
-    
-    // Парсинг всех информационных блоков "заголовок-значение"
-    $crawler->filter('.blockInfo')->each(function (Crawler $block) use (&$enrichedData) {
+
+    $crawler->filter('.blockInfo')->each(function (DomCrawler $block) use (&$enrichedData) {
         $blockTitle = $block->filter('.blockInfo__title')->text();
         $sectionData = [];
-        $block->filter('.section')->each(function (Crawler $section) use (&$sectionData) {
-            $title = $section->filter('.section__title')->count() ? trim($section->filter('.section__title')->text()) : null;
-            $info = $section->filter('.section__info')->count() ? trim($section->filter('.section__info')->text()) : null;
-            if ($title) {
+        $block->filter('.section')->each(function (DomCrawler $section) use (&$sectionData) {
+            $titleNode = $section->filter('.section__title');
+            $infoNode = $section->filter('.section__info');
+
+            if ($titleNode->count() && $infoNode->count()) {
+                $title = trim($titleNode->text());
+                $info = getNodeTextWithNewlines($infoNode);
                 $sectionData[$title] = $info;
             }
         });
@@ -94,25 +130,27 @@ function parseAuctionPage(string $htmlContent): array
 
 
 // --- ОСНОВНАЯ ЛОГИКА ЗАПУСКА ---
-
 echo "Запуск скрипта обогащения данных...\n";
 
-// 1. Читаем исходный файл
 if (!file_exists(INPUT_FILE)) {
     die("Ошибка: Входной файл '" . INPUT_FILE . "' не найден. Сначала запустите первый скрипт.\n");
 }
 $sourceContracts = json_decode(file_get_contents(INPUT_FILE), true);
+if (!is_array($sourceContracts)) {
+    die("Ошибка: Не удалось прочитать данные из '" . INPUT_FILE . "'. Файл поврежден или имеет неверный формат.\n");
+}
 $totalContracts = count($sourceContracts);
 echo "Найдено $totalContracts контрактов в '" . INPUT_FILE . "'.\n";
 
-// 2. Загружаем уже обработанные данные для возобновления
 $enrichedContracts = [];
 if (file_exists(OUTPUT_FILE)) {
     echo "Найден файл с результатами '" . OUTPUT_FILE . "'. Попытка возобновить работу...\n";
-    $enrichedContracts = json_decode(file_get_contents(OUTPUT_FILE), true);
+    $enrichedData = json_decode(file_get_contents(OUTPUT_FILE), true);
+    if (is_array($enrichedData)) {
+        $enrichedContracts = $enrichedData;
+    }
 }
 
-// Создаем карту уже обработанных контрактов для быстрой проверки
 $processedMap = [];
 foreach ($enrichedContracts as $contract) {
     if (isset($contract['registry_number'])) {
@@ -122,21 +160,18 @@ foreach ($enrichedContracts as $contract) {
 $processedCount = count($processedMap);
 echo "$processedCount контрактов уже было обработано.\n";
 
-// 3. Начинаем основной цикл
 $currentIndex = 0;
 foreach ($sourceContracts as $contract) {
     $currentIndex++;
     $registryNumber = $contract['registry_number'] ?? null;
 
-    // Пропускаем, если уже обработано
-    if (isset($processedMap[$registryNumber])) {
+    if (!$registryNumber || isset($processedMap[$registryNumber])) {
         displayProgressBar($currentIndex, $totalContracts);
         continue;
     }
 
     echo "\nОбработка контракта $currentIndex/$totalContracts ($registryNumber)...\n";
 
-    // 2.1 Извлекаем номер аукциона
     $procurementDetails = $contract['procurement_details'] ?? null;
     if (!$procurementDetails) {
         echo "  - Пропущено: отсутствует поле 'procurement_details'.\n";
@@ -149,26 +184,25 @@ foreach ($sourceContracts as $contract) {
         continue;
     }
 
-    // 2.2 Загружаем страницу аукциона
     $auctionUrl = "https://zakupki.gov.ru/epz/order/notice/ea615/view/common-info.html?regNumber=" . $auctionNumber;
     $auctionHtml = fetchUrl($auctionUrl);
     
     if (!$auctionHtml) {
         echo "  - Пропущено: не удалось загрузить страницу аукциона.\n";
-        sleep(5); // Пауза в случае ошибки, чтобы не забанили
+        sleep(5);
         continue;
     }
 
-    // 2.3 Парсим и объединяем данные
     $auctionData = parseAuctionPage($auctionHtml);
     $mergedContract = array_merge($contract, ['procurement_info' => $auctionData]);
     
-    // Добавляем результат и сразу сохраняем
     $enrichedContracts[] = $mergedContract;
     file_put_contents(OUTPUT_FILE, json_encode($enrichedContracts, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
-    
+
+    $processedMap[$registryNumber] = true;
+
     displayProgressBar($currentIndex, $totalContracts);
-    //sleep(2); // Пауза между запросами, чтобы не нагружать сервер
+    //sleep(2);
 }
 
 echo "\n\n=================================================\n";

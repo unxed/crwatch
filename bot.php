@@ -1,5 +1,4 @@
 <?php
-// bot.php (финальная версия с гибридным поиском)
 
 require 'vendor/autoload.php';
 require_once 'config.php';
@@ -26,10 +25,27 @@ function truncateForTelegram(string $text, int $maxLength = 1000): string {
     return $text;
 }
 
+/**
+ * Улучшенная функция "нормализации" поискового запроса пользователя.
+ */
+function normalizeSearchQuery(string $text): array
+{
+    $stopWords = [
+        'улица', 'ул', 'область', 'обл', 'район', 'р-н', 'рн', 'город', 'гор', 'г',
+        'поселок', 'пос', 'п', 'село', 'с', 'деревня', 'дер', 'д', 'дом',
+        'проспект', 'пр-т', 'пр', 'бульвар', 'б-р', 'республика', 'респ'
+    ];
+
+    $text = preg_replace('/[.,\/#!$%\^&\*;:{}=\-`~()]/', ' ', mb_strtolower($text));
+    $words = preg_split('/\s+/', $text, -1, PREG_SPLIT_NO_EMPTY);
+
+    return array_diff($words, $stopWords);
+}
+
+
 // =============================================================================
 // ИНИЦИАЛИЗАЦИЯ
 // =============================================================================
-
 try {
     $telegram = new Api(BOT_TOKEN);
     $dsn = "mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=utf8mb4";
@@ -47,7 +63,6 @@ try {
 // =============================================================================
 // ОСНОВНОЙ ЦИКЛ БОТА
 // =============================================================================
-
 echo "Бот запущен... Нажмите Ctrl+C для остановки.\n";
 logMessage("Бот запущен.");
 
@@ -78,36 +93,26 @@ while (true) {
             }
 
             logMessage("Получен поисковый запрос от chat_id $chatId: '$text'");
-            
-            // --- НОВАЯ ЛОГИКА ПОДГОТОВКИ ЗАПРОСА ---
-            
-            // 1. Очистка и разбивка на слова
-            $stopWords = ['улица', 'ул', 'область', 'обл', 'район', 'р-н', 'рн', 'город', 'гор', 'г', 'поселок', 'пос', 'п', 'село', 'с', 'деревня', 'дер', 'д', 'дом', 'проспект', 'пр-т', 'пр', 'бульвар', 'б-р', 'республика', 'респ'];
-            $cleanedText = preg_replace('/[.,\/#!$%\^&\*;:{}=\-`~()]/', ' ', mb_strtolower($text));
-            $keywords = preg_split('/\s+/', $cleanedText, -1, PREG_SPLIT_NO_EMPTY);
-            
-            $searchableKeywords = array_diff($keywords, $stopWords);
 
-            if (empty($searchableKeywords)) {
+            $keywords = normalizeSearchQuery($text);
+
+            if (empty($keywords)) {
                 $telegram->sendMessage(['chat_id' => $chatId, 'text' => "Пожалуйста, введите более конкретный адрес для поиска."]);
                 continue;
             }
 
-            // 2. Разделение слов на длинные (для MATCH) и короткие (для LIKE)
             $fulltext_words = [];
-            $like_conditions = [];
+            $rlike_conditions = [];
             $params = [];
-            foreach ($searchableKeywords as $index => $keyword) {
-                if (mb_strlen($keyword) >= 3) {
-                    $fulltext_words[] = '+' . $keyword . '*';
+
+            foreach ($keywords as $keyword) {
+                if (mb_strlen($keyword) < 3 || preg_match('/^\d/', $keyword)) {
+                    $rlike_conditions[] = "pl.address RLIKE '\\\\b" . preg_quote($keyword) . "\\\\b'";
                 } else {
-                    $placeholder = ":like" . $index;
-                    $like_conditions[] = "pl.address LIKE " . $placeholder;
-                    $params[$placeholder] = '%' . $keyword . '%';
+                    $fulltext_words[] = '+' . $keyword . '*';
                 }
             }
-            
-            // 3. Динамическая сборка SQL запроса
+
             $sql = "
                 SELECT 
                     p.reg_number, pl.address AS work_location, p.procurement_object,
@@ -118,44 +123,63 @@ while (true) {
                 LEFT JOIN contracts AS contr ON p.id = contr.procurement_id
                 WHERE 1=1 
             ";
-            
+
             if (!empty($fulltext_words)) {
                 $fulltext_string = implode(' ', $fulltext_words);
                 $sql .= " AND MATCH(pl.address) AGAINST(:search_string IN BOOLEAN MODE)";
                 $params[':search_string'] = $fulltext_string;
             }
 
-            if (!empty($like_conditions)) {
-                $sql .= " AND " . implode(' AND ', $like_conditions);
+            if (!empty($rlike_conditions)) {
+                $sql .= " AND (" . implode(' AND ', $rlike_conditions) . ")";
             }
-            
+
             $sql .= " LIMIT 10";
-            
+
             logMessage("Сформирован SQL: " . preg_replace('/\s+/', ' ', $sql));
             logMessage("Параметры: " . json_encode($params));
-            
+
             $stmt = $pdo->prepare($sql);
             $stmt->execute($params);
             $results = $stmt->fetchAll();
 
-            // 4. Формирование и отправка ответа
             if (empty($results)) {
                 $telegram->sendMessage(['chat_id' => $chatId, 'text' => "😔 К сожалению, по вашему запросу ничего не найдено."]);
             } else {
                 $count = count($results);
-                $telegram->sendMessage(['chat_id' => $chatId, 'text' => "✅ Найдено закупок: *" . $count . "*", 'parse_mode' => 'MarkdownV2']);
-                
+                $telegram->sendMessage([
+                    'chat_id' => $chatId,
+                    'text' => "✅ Найдено закупок: *" . $count . "*",
+                    'parse_mode' => 'MarkdownV2'
+                ]);
+
                 foreach ($results as $index => $row) {
                     $priceFormatted = $row['price'] ? number_format($row['price'], 2, ',', ' ') . ' ₽' : 'Нет данных';
+                    
                     $objectText = truncateForTelegram($row['procurement_object'] ?? 'Нет данных', 500);
                     $locationText = truncateForTelegram($row['work_location'] ?? 'Нет данных', 250);
                     $detailsUrl = "https://zakupki.gov.ru/epz/order/notice/ea615/view/common-info.html?regNumber=" . $row['reg_number'];
 
-                    $itemBlock = ["*" . escapeMarkdownV2(($index + 1) . ". Закупка №" . $row['reg_number']) . "*", "", "*Объект:* " . escapeMarkdownV2($objectText), "*Адрес:* " . escapeMarkdownV2($locationText), "*Цена контракта:* " . escapeMarkdownV2($priceFormatted), "*Дата заключения:* " . escapeMarkdownV2($row['conclusion_date'] ?? 'Нет данных'), "*Заказчик:* " . escapeMarkdownV2($row['customer_name'] ?? 'Нет данных'), "[Подробнее на сайте](" . $detailsUrl . ")"];
+                    $itemBlock = [
+                        "*" . escapeMarkdownV2(($index + 1) . ". Закупка №" . $row['reg_number']) . "*",
+                        "",
+                        "*Объект:* " . escapeMarkdownV2($objectText),
+                        "*Адрес:* " . escapeMarkdownV2($locationText),
+                        "*Цена контракта:* " . escapeMarkdownV2($priceFormatted),
+                        "*Дата заключения:* " . escapeMarkdownV2($row['conclusion_date'] ?? 'Нет данных'),
+                        "*Заказчик:* " . escapeMarkdownV2($row['customer_name'] ?? 'Нет данных'),
+                        "[Подробнее на сайте](" . $detailsUrl . ")"
+                    ];
+
                     $reply = implode("\n", $itemBlock);
-                    
+
                     try {
-                        $telegram->sendMessage(['chat_id' => $chatId, 'text' => $reply, 'parse_mode' => 'MarkdownV2', 'disable_web_page_preview' => true]);
+                        $telegram->sendMessage([
+                            'chat_id' => $chatId,
+                            'text' => $reply,
+                            'parse_mode' => 'MarkdownV2',
+                            'disable_web_page_preview' => true
+                        ]);
                     } catch (Exception $e) {
                         $plainTextReply = preg_replace('/([_*\[\]()~`>#+\-=|{}.!\\\\])/', '', $reply);
                         $telegram->sendMessage(['chat_id' => $chatId, 'text' => $plainTextReply]);

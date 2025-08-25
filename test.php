@@ -80,8 +80,6 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
         return array_values(array_unique($addresses));
     }
 
-    // --- v26.0: Определение маркеров ---
-    // v26.0: 'обл', 'респ' и т.п. вынесены в отдельную группу, они не являются маркерами НП
     $regionTypes = ['обл', 'респ', 'край', 'ао'];
     $baseMajorLocalityTypes = ['г', 'с', 'п', 'рп', 'пгт', 'село', 'город', 'деревня', 'станица', 'поселок', 'пос'];
     $districtTypes = ['р-н', 'район'];
@@ -89,16 +87,11 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
     $streetTypes = ['ул', 'улица', 'пр', 'пр-т', 'проспект', 'пер', 'переулок', 'наб', 'набережная', 'б-р', 'бульвар', 'площадь', 'пл', 'ш', 'шоссе', 'пр-д', 'проезд', 'линия', 'кан', 'тер', 'дорога'];
     $housePartTypes = ['д', 'дом', 'корп', 'к', 'стр', 'строение', 'литера', 'лит'];
     
-    // v26.0: Создаем список маркеров, которые действительно начинают адресную часть (город, улица, дом)
-    // Это нужно для правильного определения префикса.
     $addressPartStarters = array_merge($baseMajorLocalityTypes, $districtTypes, $subLocalityTypes, $streetTypes, $housePartTypes);
-    // Полный список всех маркеров для общего использования
     $allMarkers = array_merge($regionTypes, $addressPartStarters);
 
-    // --- v26.0: Улучшенный эвристический фильтр ---
     $minTokensForHeuristic = 20;
     $maxMarkerRatioForText = 0.05;
-    // v26.0: Добавляем 'п' (пункт) в стоп-лист для эвристики
     $heuristicMarkers = array_diff($allMarkers, ['с', 'к', 'п']);
 
     $heuristicTokens = explode(' ', preg_replace(['/\s+/', '/([,.])\1+/'], [' ', '$1'], $addressBlock));
@@ -124,9 +117,7 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
     } else {
         $logger->log(sprintf("HEURISTIC_SKIP: Token count (%d) is not above threshold (%d). Proceeding to FSM.", $tokenCount, $minTokensForHeuristic));
     }
-    // --- Конец эвристического фильтра ---
 
-    // --- Машина состояний (FSM) для детального разделения ---
     $logger->log("FSM_S");
     
     $addressBlock = preg_replace(['/\s+/', '/([,.])\1+/'], [' ', '$1'], $addressBlock);
@@ -141,7 +132,6 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
 
     $prefix = '';
     $firstMarkerIndex = -1;
-    // v26.0: Ищем первый маркер, который начинает именно адресную часть, а не регион
     foreach ($tokens as $i => $token) {
         if (in_array(mb_strtolower(rtrim($token, '.'), 'UTF-8'), $addressPartStarters)) {
             $firstMarkerIndex = $i;
@@ -243,7 +233,9 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
                 }
             }
 
-            if (!$startNewAddress && $addressPartCompleted && ($isStreet || (!$isMarker && $token !== ','))) {
+            // v28.0: Добавляем проверку на $isLocality. Если предыдущий адрес завершен (например, ...д.5, ),
+            // то появление нового маркера НП (г., пос., р-н) должно инициировать разделение. Это исправляет Bug 13.
+            if (!$startNewAddress && $addressPartCompleted && ($isStreet || $isLocality || (!$isMarker && $token !== ','))) {
                  $startNewAddress = true;
                  $splitReason = 2;
             }
@@ -259,17 +251,18 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
             $logLine .= " | a:=> \"" . $builtAddress . "\"";
             $finalAddresses[] = $builtAddress;
             
-            if ($splitReason === 1) {
+            if ($splitReason === 1 || ($splitReason === 2 && $isLocality)) {
                 $currentAddressParts = [];
                 $localityContextParts = [];
                 $localityContextIsValid = false;
-                $logLine .= " | CR";
+                $hasSeenLocality = false;
+                $logLine .= " | CR_LOC";
             } else {
                 $currentAddressParts = $localityContextIsValid ? $localityContextParts : [];
+                $hasSeenLocality = $localityContextIsValid;
                 $logLine .= " | C>";
             }
             
-            $hasSeenLocality = $localityContextIsValid;
             $hasSeenStreet = false;
             $hasSeenHousePart = false;
             $addressPartCompleted = false;
@@ -282,26 +275,30 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
 
         $currentAddressParts[] = $token;
 
-        if ($isStreet && !$hasSeenStreet && !$localityContextIsValid) {
-            $streetMarkerIndex = count($currentAddressParts) - 1;
-            $streetNameStartIndex = $streetMarkerIndex;
+        if (($isLocality || $isStreet) && !$localityContextIsValid) {
+            $markerIndex = count($currentAddressParts) - 1;
+            $nameStartIndex = $markerIndex;
 
-            while ($streetNameStartIndex > 0 && $currentAddressParts[$streetNameStartIndex - 1] !== ',') {
-                $streetNameStartIndex--;
+            while ($nameStartIndex > 0 && $currentAddressParts[$nameStartIndex - 1] !== ',') {
+                $nameStartIndex--;
             }
 
-            $potentialContext = array_slice($currentAddressParts, 0, $streetNameStartIndex);
+            $potentialContext = array_slice($currentAddressParts, 0, $nameStartIndex);
+            $potentialContext = array_filter($potentialContext, fn($t) => trim($t) !== '');
             
-            $isNowValid = false;
-            foreach ($potentialContext as $part) {
-                if (in_array(mb_strtolower(rtrim($part, '.'), 'UTF-8'), array_merge($baseMajorLocalityTypes, $districtTypes, $subLocalityTypes))) {
-                    $isNowValid = true;
-                    break;
+            if (!empty($potentialContext)) {
+                $isNowValid = false;
+                foreach ($potentialContext as $part) {
+                    if (in_array(mb_strtolower(rtrim($part, '.'), 'UTF-8'), array_merge($baseMajorLocalityTypes, $districtTypes, $subLocalityTypes))) {
+                        $isNowValid = true;
+                        break;
+                    }
                 }
-            }
-            if ($isNowValid) {
-                $localityContextParts = $potentialContext;
-                $localityContextIsValid = true;
+                if ($isNowValid) {
+                    $localityContextParts = $potentialContext;
+                    $localityContextIsValid = true;
+                    $logger->log("CTX_SET: [" . implode('|', $localityContextParts) . "] on token '" . $token . "'");
+                }
             }
         }
 

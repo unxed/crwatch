@@ -18,3 +18,6 @@ SELECT
 FROM
     procurement_locations;
 
+
+-- 01418b1667ea90f1a2694502bb1b2fdd7cab3ee5 - 295, 2024, 2319
+    

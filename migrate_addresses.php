@@ -18,26 +18,18 @@ function splitAddresses(string $addressBlock): array
     }
 
     $addressBlock = trim($addressBlock);
-    // Сначала очищаем от множественных пробелов и знаков препинания
     $addressBlock = preg_replace(['/\s+/', '/([,.])\1+/'], [' ', '$1'], $addressBlock);
-    
-    // Предварительная обработка составных маркеров, чтобы они стали одним токеном
     $addressBlock = preg_replace('/р\.\s*п\./i', 'рп.', $addressBlock);
 
-    // Приоритет 1: Разделение по надежным явным разделителям (точка с запятой, перенос строки)
-    // Рекурсивно вызываем себя для каждой части
     $parts = preg_split('/[;\r\n]+/', $addressBlock);
     if (count($parts) > 1) {
         $allAddresses = [];
-        foreach ($parts as $part) {
-            if (!empty(trim($part))) {
-                $allAddresses = array_merge($allAddresses, splitAddresses(trim($part)));
-            }
+        foreach ($parts as $i => $part) {
+            $allAddresses = array_merge($allAddresses, splitAddresses(trim($part)));
         }
         return array_values(array_unique($allAddresses));
     }
 
-    // Приоритет 2: Разделение по "Российская Федерация", если их несколько
     $delimiter = 'Российская Федерация';
     if (substr_count(mb_strtolower($addressBlock), mb_strtolower($delimiter)) > 1) {
         $parts = preg_split("/(" . preg_quote($delimiter, '/') . ")/i", $addressBlock, -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY);
@@ -59,27 +51,23 @@ function splitAddresses(string $addressBlock): array
         return array_values(array_unique($addresses));
     }
 
-    // Приоритет 3: "Машина состояний" для разбора склеенных адресов
-    
-    // Подготовка токенов
+    // --- Машина состояний ---
     $preparedBlock = str_replace(',', ' , ', $addressBlock);
     $preparedBlock = preg_replace('~(\S\.)([^\s.])~u', '$1 $2', $preparedBlock);
     $preparedBlock = trim(preg_replace('/\s+/', ' ', $preparedBlock));
     $tokens = explode(' ', $preparedBlock);
 
-    // Маркеры
-    $majorLocalityTypes = ['г', 'с', 'п', 'рп', 'пгт', 'село', 'город', 'деревня', 'станица', 'поселок'];
+    $majorLocalityTypes = ['г', 'с', 'п', 'рп', 'пгт', 'село', 'город', 'деревня', 'станица', 'поселок', 'пос'];
     $subLocalityTypes = ['мкр', 'мкрн'];
     $localityTypes = array_merge($majorLocalityTypes, $subLocalityTypes);
-    $streetTypes = ['ул', 'улица', 'пр', 'пр-т', 'проспект', 'пер', 'переулок', 'наб', 'набережная', 'б-р', 'бульвар', 'площадь', 'пл', 'ш', 'шоссе', 'пр-д', 'проезд', 'линия', 'кан', 'тер'];
+    $streetTypes = ['ул', 'улица', 'пр', 'пр-т', 'проспект', 'пер', 'переулок', 'наб', 'набережная', 'б-р', 'бульвар', 'площадь', 'пл', 'ш', 'шоссе', 'пр-д', 'проезд', 'линия', 'кан', 'тер', 'дорога'];
     $housePartTypes = ['д', 'дом', 'корп', 'к', 'стр', 'строение', 'литера', 'лит'];
     $allMarkers = array_merge($localityTypes, $streetTypes, $housePartTypes);
 
-    // Определение префикса (РФ, область, район)
     $prefix = '';
     $firstMarkerIndex = -1;
     foreach ($tokens as $i => $token) {
-        if (in_array(rtrim($token, '.'), $allMarkers)) {
+        if (in_array(mb_strtolower(rtrim($token, '.'), 'UTF-8'), $allMarkers)) {
             $firstMarkerIndex = $i;
             break;
         }
@@ -99,10 +87,9 @@ function splitAddresses(string $addressBlock): array
         return [buildAddress('', $tokens)];
     }
 
-    // Основной цикл машины состояний
     $finalAddresses = [];
     $currentAddressParts = [];
-    
+
     $localityContextParts = [];
     $localityContextIsValid = false;
     $hasSeenLocality = false;
@@ -110,8 +97,28 @@ function splitAddresses(string $addressBlock): array
     $hasSeenHousePart = false;
     $addressPartCompleted = false;
 
+    // Инициализация контекста из префикса
+    if (!empty($prefix)) {
+        $prefixTokens = explode(' ', str_replace(',', ' , ', $prefix));
+        $lastCommaPos = array_search(',', array_reverse($prefixTokens, true));
+
+        $potentialContext = ($lastCommaPos !== false) ? array_slice($prefixTokens, $lastCommaPos + 1) : $prefixTokens;
+        $potentialContext = array_filter($potentialContext, 'trim'); 
+
+        if (!empty($potentialContext)) {
+            foreach ($potentialContext as $pToken) {
+                if (in_array(mb_strtolower(rtrim($pToken, '.'), 'UTF-8'), $localityTypes)) {
+                    $localityContextParts = $potentialContext;
+                    $localityContextIsValid = true;
+                    $hasSeenLocality = true;
+                    break;
+                }
+            }
+        }
+    }
+
     foreach ($tokens as $token) {
-        $cleanToken = rtrim($token, '.');
+        $cleanToken = mb_strtolower(rtrim($token, '.'), 'UTF-8');
         
         $isLocality = in_array($cleanToken, $localityTypes);
         $isMajorLocality = in_array($cleanToken, $majorLocalityTypes);
@@ -120,14 +127,13 @@ function splitAddresses(string $addressBlock): array
         $isMarker = $isLocality || $isStreet || $isHousePart;
 
         $startNewAddress = false;
-        $splitByLocality = false;
+
         if (!empty($currentAddressParts)) {
             if ($isMajorLocality && ($hasSeenStreet || $hasSeenLocality)) {
                 $startNewAddress = true;
-                $splitByLocality = true;
             }
             if (!$startNewAddress && $addressPartCompleted && ($isStreet || (!$isMarker && $token !== ','))) {
-                 $startNewAddress = true;
+                $startNewAddress = true;
             }
             if (!$startNewAddress && $isStreet && $hasSeenHousePart) {
                 $startNewAddress = true;
@@ -135,16 +141,10 @@ function splitAddresses(string $addressBlock): array
         }
 
         if ($startNewAddress) {
-            $finalAddresses[] = buildAddress($prefix, $currentAddressParts);
-            
-            if ($splitByLocality) {
-                $currentAddressParts = [];
-                $localityContextParts = [];
-                $localityContextIsValid = false;
-            } else {
-                $currentAddressParts = $localityContextIsValid ? $localityContextParts : [];
-            }
+            $builtAddress = buildAddress($prefix, $currentAddressParts);
+            $finalAddresses[] = $builtAddress;
 
+            $currentAddressParts = $localityContextIsValid ? $localityContextParts : [];
             $hasSeenLocality = $localityContextIsValid;
             $hasSeenStreet = false;
             $hasSeenHousePart = false;
@@ -153,16 +153,32 @@ function splitAddresses(string $addressBlock): array
 
         $currentAddressParts[] = $token;
 
-        if ($isLocality) $hasSeenLocality = true;
-        if ($isStreet) $hasSeenStreet = true;
-        if ($isHousePart) $hasSeenHousePart = true;
+        if ($isStreet && !$hasSeenStreet && !$localityContextIsValid) {
+            $streetMarkerIndex = count($currentAddressParts) - 1;
+            $streetNameStartIndex = $streetMarkerIndex;
 
-        if (!$hasSeenStreet) {
-            $localityContextParts[] = $token;
-            if ($isLocality) {
+            while ($streetNameStartIndex > 0 && $currentAddressParts[$streetNameStartIndex - 1] !== ',') {
+                $streetNameStartIndex--;
+            }
+
+            $potentialContext = array_slice($currentAddressParts, 0, $streetNameStartIndex);
+
+            $isNowValid = false;
+            foreach ($potentialContext as $part) {
+                if (in_array(mb_strtolower(rtrim($part, '.'), 'UTF-8'), $localityTypes)) {
+                    $isNowValid = true;
+                    break;
+                }
+            }
+            if ($isNowValid) {
+                $localityContextParts = $potentialContext;
                 $localityContextIsValid = true;
             }
         }
+
+        if ($isLocality) $hasSeenLocality = true;
+        if ($isStreet) $hasSeenStreet = true;
+        if ($isHousePart) $hasSeenHousePart = true;
 
         if ($token === ',' && $hasSeenHousePart) {
             $addressPartCompleted = true;
@@ -183,10 +199,9 @@ function buildAddress(string $prefix, array $parts): string {
     $address = trim($address);
     $address = preg_replace('/\s*,\s*/', ', ', $address);
     $address = preg_replace('/ ,/', ',', $address);
-    $address = preg_replace(['/\s*,\s*$/', '/\s+/'], ['', ' '], $address);
-    return $address;
+    $address = preg_replace(['/\s*,\s*$/', '/\s+/'], ['', ' '], ' ' . $address);
+    return trim($address);
 }
-
 
 // =============================================================================
 // ОСНОВНАЯ ЛОГИКА МИГРАЦИИ
@@ -204,9 +219,16 @@ try {
 }
 
 try {
-    logMigrate("1. Проверка и создание таблицы `procurement_locations`...");
+
+    logMigrate("0. Удаление таблицы `procurement_locations`, если такая есть...");
     $pdo->exec("
-        CREATE TABLE IF NOT EXISTS `procurement_locations` (
+        DROP TABLE IF EXISTS `procurement_locations`;
+    ");
+    logMigrate("Таблица `procurement_locations` удалена (если вообще существовала).");
+
+    logMigrate("1. Создание таблицы `procurement_locations`...");
+    $pdo->exec("
+        CREATE TABLE `procurement_locations` (
           `id` int(11) NOT NULL AUTO_INCREMENT,
           `procurement_id` int(11) NOT NULL,
           `address` text NOT NULL,
@@ -258,6 +280,7 @@ try {
         logMigrate("\nПеренос завершен. Всего перенесено $totalAddresses отдельных адресов.");
     }
 
+    /*
     logMigrate("5. Удаление старого поля 'work_location' и его индекса...");
     $checkIndexStmt = $pdo->query("SHOW INDEX FROM procurements WHERE Key_name = 'work_location'");
     if ($checkIndexStmt->rowCount() > 0) {
@@ -266,6 +289,7 @@ try {
     }
     $pdo->exec("ALTER TABLE procurements DROP COLUMN work_location;");
     logMigrate("Старое поле 'work_location' удалено.");
+    */
 
     logMigrate("\n=== Миграция успешно завершена! ===");
 

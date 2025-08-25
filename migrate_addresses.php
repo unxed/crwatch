@@ -60,6 +60,8 @@ function splitAddresses(string $addressBlock): array
     $addressPartStarters = array_merge($baseMajorLocalityTypes, $districtTypes, $subLocalityTypes, $streetTypes, $housePartTypes);
     $allMarkers = array_merge($regionTypes, $addressPartStarters);
 
+    $groupSeparators = ['го:', 'мр:'];
+
     $minTokensForHeuristic = 20;
     $maxMarkerRatioForText = 0.05;
     $heuristicMarkers = array_diff($allMarkers, ['с', 'к', 'п']);
@@ -75,6 +77,7 @@ function splitAddresses(string $addressBlock): array
             }
         }
         $markerRatio = ($tokenCount > 0) ? $markerCount / $tokenCount : 0;
+        
         if ($markerRatio < $maxMarkerRatioForText) {
             return [$addressBlock];
         }
@@ -144,11 +147,20 @@ function splitAddresses(string $addressBlock): array
     }
 
     foreach ($tokens as $token) {
-        if (mb_substr($token, -1) === ':') {
+        $cleanTokenWithColon = mb_strtolower($token, 'UTF-8');
+        $cleanToken = mb_strtolower(rtrim($token, '.'), 'UTF-8');
+
+        if (in_array($cleanTokenWithColon, $groupSeparators)) {
+            if (!empty(array_filter($currentAddressParts, 'trim'))) {
+                $builtAddress = buildAddress($prefix, $currentAddressParts);
+                $finalAddresses[] = $builtAddress;
+            }
+            $currentAddressParts = [];
+            $localityContextParts = [];
+            $localityContextIsValid = false;
+            $hasSeenLocality = $hasSeenStreet = $hasSeenHousePart = $addressPartCompleted = $partJustFinished = false;
             continue;
         }
-
-        $cleanToken = mb_strtolower(rtrim($token, '.'), 'UTF-8');
         
         $isDistrict = in_array($cleanToken, $districtTypes);
         $isMajorDistrict = $isDistrict && !$hasSeenStreet;

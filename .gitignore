@@ -4,3 +4,6 @@ config.php
 contracts.json
 database_dump.sql
 vendor/
+ai_log.txt
+human_log.txt
+test.log

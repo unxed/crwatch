@@ -90,6 +90,9 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
     $addressPartStarters = array_merge($baseMajorLocalityTypes, $districtTypes, $subLocalityTypes, $streetTypes, $housePartTypes);
     $allMarkers = array_merge($regionTypes, $addressPartStarters);
 
+    // v30.0: Явный список групповых разделителей
+    $groupSeparators = ['го:', 'мр:'];
+
     $minTokensForHeuristic = 20;
     $maxMarkerRatioForText = 0.05;
     $heuristicMarkers = array_diff($allMarkers, ['с', 'к', 'п']);
@@ -188,12 +191,25 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
     }
 
     foreach ($tokens as $token) {
-        if (mb_substr($token, -1) === ':') {
-            $logger->log("'$token' | Group marker, skipping.");
-            continue;
-        }
-
+        $cleanTokenWithColon = mb_strtolower($token, 'UTF-8');
         $cleanToken = mb_strtolower(rtrim($token, '.'), 'UTF-8');
+
+        // --- v30.0: Улучшенная обработка групповых разделителей ---
+        if (in_array($cleanTokenWithColon, $groupSeparators)) {
+            $logger->log("'$token' | Group separator found.");
+            if (!empty(array_filter($currentAddressParts, 'trim'))) {
+                $builtAddress = buildAddress($prefix, $currentAddressParts);
+                $finalAddresses[] = $builtAddress;
+                $logger->log("FINALIZED_BY_SEPARATOR: \"" . $builtAddress . "\"");
+            }
+            // Полный сброс состояния для нового списка
+            $currentAddressParts = [];
+            $localityContextParts = [];
+            $localityContextIsValid = false;
+            $hasSeenLocality = $hasSeenStreet = $hasSeenHousePart = $addressPartCompleted = $partJustFinished = false;
+            continue; // Пропускаем сам маркер (ГО:, МР:)
+        }
+        // --- Конец блока v30.0 ---
         
         $isDistrict = in_array($cleanToken, $districtTypes);
         $isMajorDistrict = $isDistrict && !$hasSeenStreet;
@@ -233,8 +249,6 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
                 }
             }
 
-            // v28.0: Добавляем проверку на $isLocality. Если предыдущий адрес завершен (например, ...д.5, ),
-            // то появление нового маркера НП (г., пос., р-н) должно инициировать разделение. Это исправляет Bug 13.
             if (!$startNewAddress && $addressPartCompleted && ($isStreet || $isLocality || (!$isMarker && $token !== ','))) {
                  $startNewAddress = true;
                  $splitReason = 2;

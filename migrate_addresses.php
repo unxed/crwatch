@@ -8,7 +8,7 @@ function logMigrate(string $message): void {
 }
 
 // =============================================================================
-// ВАШИ ФУНКЦИИ ИЗ ТЕСТОВОГО СКРИПТА, в котором вы их отладили
+// АЛГОРИТМ РАЗДЕЛЕНИЯ АДРЕСОВ
 // =============================================================================
 
 function splitAddresses(string $addressBlock): array
@@ -16,22 +16,28 @@ function splitAddresses(string $addressBlock): array
     if (empty(trim($addressBlock))) {
         return [];
     }
-    
-    // В миграционном скрипте подробный лог не нужен, но оставим его закомментированным на всякий случай
-    // echo "--- НАЧАЛО ОБРАБОТКИ БЛОКА ---\n";
-    $addressBlock = trim($addressBlock);
-    $addressBlock = preg_replace(['/\s+/', '/([,.])\1+/'], [' ', '$1'], $addressBlock);
-    // echo "Исходный текст: " . str_replace("\n", " ", $addressBlock) . "\n";
 
+    $addressBlock = trim($addressBlock);
+    // Сначала очищаем от множественных пробелов и знаков препинания
+    $addressBlock = preg_replace(['/\s+/', '/([,.])\1+/'], [' ', '$1'], $addressBlock);
+    
+    // Предварительная обработка составных маркеров, чтобы они стали одним токеном
+    $addressBlock = preg_replace('/р\.\s*п\./i', 'рп.', $addressBlock);
+
+    // Приоритет 1: Разделение по надежным явным разделителям (точка с запятой, перенос строки)
+    // Рекурсивно вызываем себя для каждой части
     $parts = preg_split('/[;\r\n]+/', $addressBlock);
     if (count($parts) > 1) {
         $allAddresses = [];
         foreach ($parts as $part) {
-            $allAddresses = array_merge($allAddresses, splitAddresses(trim($part)));
+            if (!empty(trim($part))) {
+                $allAddresses = array_merge($allAddresses, splitAddresses(trim($part)));
+            }
         }
         return array_values(array_unique($allAddresses));
     }
 
+    // Приоритет 2: Разделение по "Российская Федерация", если их несколько
     $delimiter = 'Российская Федерация';
     if (substr_count(mb_strtolower($addressBlock), mb_strtolower($delimiter)) > 1) {
         $parts = preg_split("/(" . preg_quote($delimiter, '/') . ")/i", $addressBlock, -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY);
@@ -53,20 +59,27 @@ function splitAddresses(string $addressBlock): array
         return array_values(array_unique($addresses));
     }
 
+    // Приоритет 3: "Машина состояний" для разбора склеенных адресов
+    
+    // Подготовка токенов
     $preparedBlock = str_replace(',', ' , ', $addressBlock);
     $preparedBlock = preg_replace('~(\S\.)([^\s.])~u', '$1 $2', $preparedBlock);
     $preparedBlock = trim(preg_replace('/\s+/', ' ', $preparedBlock));
     $tokens = explode(' ', $preparedBlock);
 
-    $localityTypes = ['г.', 'с.', 'п.', 'р.п.', 'пгт.', 'мкр.', 'мкрн.', 'село', 'город', 'деревня', 'станица', 'поселок'];
-    $streetTypes = ['ул.', 'улица', 'пр.', 'пр-т', 'проспект', 'пер.', 'переулок', 'наб.', 'набережная', 'б-р', 'бульвар', 'площадь', 'пл.', 'ш.', 'шоссе', 'пр-д', 'проезд', 'линия', 'кан.', 'тер.'];
-    $housePartTypes = ['д.', 'дом', 'корп.', 'к.', 'стр.', 'строение', 'литера', 'лит.'];
+    // Маркеры
+    $majorLocalityTypes = ['г', 'с', 'п', 'рп', 'пгт', 'село', 'город', 'деревня', 'станица', 'поселок'];
+    $subLocalityTypes = ['мкр', 'мкрн'];
+    $localityTypes = array_merge($majorLocalityTypes, $subLocalityTypes);
+    $streetTypes = ['ул', 'улица', 'пр', 'пр-т', 'проспект', 'пер', 'переулок', 'наб', 'набережная', 'б-р', 'бульвар', 'площадь', 'пл', 'ш', 'шоссе', 'пр-д', 'проезд', 'линия', 'кан', 'тер'];
+    $housePartTypes = ['д', 'дом', 'корп', 'к', 'стр', 'строение', 'литера', 'лит'];
     $allMarkers = array_merge($localityTypes, $streetTypes, $housePartTypes);
 
+    // Определение префикса (РФ, область, район)
     $prefix = '';
     $firstMarkerIndex = -1;
     foreach ($tokens as $i => $token) {
-        if (in_array($token, $allMarkers)) {
+        if (in_array(rtrim($token, '.'), $allMarkers)) {
             $firstMarkerIndex = $i;
             break;
         }
@@ -83,36 +96,56 @@ function splitAddresses(string $addressBlock): array
             $tokens = array_slice($tokens, $startIndex);
         }
     } else {
-        return [$addressBlock];
+        return [buildAddress('', $tokens)];
     }
-    
+
+    // Основной цикл машины состояний
     $finalAddresses = [];
     $currentAddressParts = [];
+    
+    $localityContextParts = [];
+    $localityContextIsValid = false;
     $hasSeenLocality = false;
     $hasSeenStreet = false;
     $hasSeenHousePart = false;
     $addressPartCompleted = false;
 
     foreach ($tokens as $token) {
-        $isLocality = in_array($token, $localityTypes);
-        $isStreet = in_array($token, $streetTypes);
-        $isHousePart = in_array($token, $housePartTypes);
-        $isMarker = in_array($token, $allMarkers);
+        $cleanToken = rtrim($token, '.');
+        
+        $isLocality = in_array($cleanToken, $localityTypes);
+        $isMajorLocality = in_array($cleanToken, $majorLocalityTypes);
+        $isStreet = in_array($cleanToken, $streetTypes);
+        $isHousePart = in_array($cleanToken, $housePartTypes);
+        $isMarker = $isLocality || $isStreet || $isHousePart;
 
         $startNewAddress = false;
+        $splitByLocality = false;
         if (!empty($currentAddressParts)) {
-            if ($isLocality && ($hasSeenStreet || $hasSeenLocality)) {
+            if ($isMajorLocality && ($hasSeenStreet || $hasSeenLocality)) {
                 $startNewAddress = true;
+                $splitByLocality = true;
             }
-            if ($addressPartCompleted && !$isMarker && $token !== ',') {
+            if (!$startNewAddress && $addressPartCompleted && ($isStreet || (!$isMarker && $token !== ','))) {
+                 $startNewAddress = true;
+            }
+            if (!$startNewAddress && $isStreet && $hasSeenHousePart) {
                 $startNewAddress = true;
             }
         }
 
         if ($startNewAddress) {
             $finalAddresses[] = buildAddress($prefix, $currentAddressParts);
-            $currentAddressParts = [];
-            $hasSeenLocality = false;
+            
+            if ($splitByLocality) {
+                $currentAddressParts = [];
+                $localityContextParts = [];
+                $localityContextIsValid = false;
+            } else {
+                $currentAddressParts = $localityContextIsValid ? $localityContextParts : [];
+            }
+
+            $hasSeenLocality = $localityContextIsValid;
             $hasSeenStreet = false;
             $hasSeenHousePart = false;
             $addressPartCompleted = false;
@@ -123,9 +156,18 @@ function splitAddresses(string $addressBlock): array
         if ($isLocality) $hasSeenLocality = true;
         if ($isStreet) $hasSeenStreet = true;
         if ($isHousePart) $hasSeenHousePart = true;
-        
+
+        if (!$hasSeenStreet) {
+            $localityContextParts[] = $token;
+            if ($isLocality) {
+                $localityContextIsValid = true;
+            }
+        }
+
         if ($token === ',' && $hasSeenHousePart) {
             $addressPartCompleted = true;
+        } elseif ($hasSeenHousePart) {
+            $addressPartCompleted = false;
         }
     }
 
@@ -145,9 +187,11 @@ function buildAddress(string $prefix, array $parts): string {
     return $address;
 }
 
+
 // =============================================================================
 // ОСНОВНАЯ ЛОГИКА МИГРАЦИИ
 // =============================================================================
+
 echo "Запуск миграции структуры адресов...\n";
 logMigrate("=== Начало сеанса миграции ===");
 

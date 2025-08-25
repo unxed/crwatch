@@ -1,5 +1,4 @@
 <?php
-// migrate_addresses.php (версия 7.0, с финальной эвристикой)
 
 require_once 'config.php';
 
@@ -8,70 +7,147 @@ function logMigrate(string $message): void {
     file_put_contents(MIGRATE_LOG_FILE, date('[Y-m-d H:i:s] ') . $message . PHP_EOL, FILE_APPEND);
 }
 
-/**
- * Финальная, самая умная функция для разбивки адресов.
- */
+// =============================================================================
+// ВАШИ ФУНКЦИИ ИЗ ТЕСТОВОГО СКРИПТА, в котором вы их отладили
+// =============================================================================
+
 function splitAddresses(string $addressBlock): array
 {
-    $addressBlock = trim($addressBlock);
+    if (empty(trim($addressBlock))) {
+        return [];
+    }
     
-    // Приоритет 1: Разделение по точке с запятой (самый надежный)
-    if (str_contains($addressBlock, ';')) {
-        return array_filter(array_map('trim', explode(';', $addressBlock)));
+    // В миграционном скрипте подробный лог не нужен, но оставим его закомментированным на всякий случай
+    // echo "--- НАЧАЛО ОБРАБОТКИ БЛОКА ---\n";
+    $addressBlock = trim($addressBlock);
+    $addressBlock = preg_replace(['/\s+/', '/([,.])\1+/'], [' ', '$1'], $addressBlock);
+    // echo "Исходный текст: " . str_replace("\n", " ", $addressBlock) . "\n";
+
+    $parts = preg_split('/[;\r\n]+/', $addressBlock);
+    if (count($parts) > 1) {
+        $allAddresses = [];
+        foreach ($parts as $part) {
+            $allAddresses = array_merge($allAddresses, splitAddresses(trim($part)));
+        }
+        return array_values(array_unique($allAddresses));
     }
 
-    // Приоритет 2: Разделение по переносам строк
-    if (preg_match('/\\r\\n|\\r|\\n/', $addressBlock)) {
-        return array_filter(array_map('trim', preg_split('/\\r\\n|\\r|\\n/', $addressBlock)));
-    }
-    
-    // Приоритет 3: Разделение по "Российская Федерация", если их несколько
     $delimiter = 'Российская Федерация';
     if (substr_count(mb_strtolower($addressBlock), mb_strtolower($delimiter)) > 1) {
         $parts = preg_split("/(" . preg_quote($delimiter, '/') . ")/i", $addressBlock, -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY);
         $addresses = [];
-        for ($i = 0; $i < count($parts); $i += 2) {
-            if (isset($parts[$i], $parts[$i + 1])) {
-                $addresses[] = trim($parts[$i] . $parts[$i + 1]);
+        $currentAddress = '';
+        foreach ($parts as $part) {
+            if (mb_strtolower(trim($part)) === mb_strtolower($delimiter)) {
+                if (!empty(trim($currentAddress))) {
+                    $addresses = array_merge($addresses, splitAddresses(trim($currentAddress)));
+                }
+                $currentAddress = $part;
+            } else {
+                $currentAddress .= $part;
             }
         }
-        if (!empty($addresses)) return $addresses;
-    }
-    
-    // Приоритет 4: "Умное" разделение склеенных адресов через контекстный анализ
-    // Паттерн для типов улиц
-    $streetTypesPattern = '(?:ул|улица|пр|проспект|пер|переулок|наб|набережная|б-р|бульвар|площадь|пл|ш|шоссе|пр-д|проезд|линия|кан)\.?';
-    // Паттерн для номера дома и всего, что после него (корпус, литера и т.д.)
-    $housePattern = '(?:д|дом|двлд)\.?\s*[\w\d\s\/-]+?(?:\sлитера\s\w)?';
-    
-    // Ищем все вхождения "название улицы + номер дома"
-    $fullAddressComponentPattern = '/([\d\w\s\S]+?' . $streetTypesPattern . '[\s\S]+?' . $housePattern . ')/iu';
-
-    preg_match_all($fullAddressComponentPattern, $addressBlock, $matches);
-
-    if (isset($matches[0]) && count($matches[0]) > 1) {
-        logMigrate(" -> Обнаружен сложный случай склеенных адресов, применяется контекстный анализ...");
-        
-        $addressParts = $matches[0];
-        
-        // Определяем "префикс" (город/регион) - это все, что до первого найденного адреса
-        $firstAddressPart = $addressParts[0];
-        $prefixPos = mb_strpos($addressBlock, $firstAddressPart);
-        $prefix = trim(mb_substr($addressBlock, 0, $prefixPos));
-
-        $reconstructedAddresses = [];
-        foreach ($addressParts as $part) {
-            $reconstructedAddresses[] = trim($prefix . ' ' . trim($part));
+        if (!empty(trim($currentAddress))) {
+            $addresses = array_merge($addresses, splitAddresses(trim($currentAddress)));
         }
-        
-        logMigrate(" -> Успешно разделено на " . count($reconstructedAddresses) . " адресов.");
-        return $reconstructedAddresses;
+        return array_values(array_unique($addresses));
+    }
+
+    $preparedBlock = str_replace(',', ' , ', $addressBlock);
+    $preparedBlock = preg_replace('~(\S\.)([^\s.])~u', '$1 $2', $preparedBlock);
+    $preparedBlock = trim(preg_replace('/\s+/', ' ', $preparedBlock));
+    $tokens = explode(' ', $preparedBlock);
+
+    $localityTypes = ['г.', 'с.', 'п.', 'р.п.', 'пгт.', 'мкр.', 'мкрн.', 'село', 'город', 'деревня', 'станица', 'поселок'];
+    $streetTypes = ['ул.', 'улица', 'пр.', 'пр-т', 'проспект', 'пер.', 'переулок', 'наб.', 'набережная', 'б-р', 'бульвар', 'площадь', 'пл.', 'ш.', 'шоссе', 'пр-д', 'проезд', 'линия', 'кан.', 'тер.'];
+    $housePartTypes = ['д.', 'дом', 'корп.', 'к.', 'стр.', 'строение', 'литера', 'лит.'];
+    $allMarkers = array_merge($localityTypes, $streetTypes, $housePartTypes);
+
+    $prefix = '';
+    $firstMarkerIndex = -1;
+    foreach ($tokens as $i => $token) {
+        if (in_array($token, $allMarkers)) {
+            $firstMarkerIndex = $i;
+            break;
+        }
+    }
+
+    if ($firstMarkerIndex != -1) {
+        $startIndex = $firstMarkerIndex;
+        while ($startIndex > 0 && $tokens[$startIndex - 1] !== ',') {
+            $startIndex--;
+        }
+        if ($startIndex > 0) {
+            $prefixTokens = array_slice($tokens, 0, $startIndex);
+            $prefix = implode(' ', $prefixTokens);
+            $tokens = array_slice($tokens, $startIndex);
+        }
+    } else {
+        return [$addressBlock];
     }
     
-    // Если ничего не сработало, возвращаем как есть
-    return [trim($addressBlock)];
+    $finalAddresses = [];
+    $currentAddressParts = [];
+    $hasSeenLocality = false;
+    $hasSeenStreet = false;
+    $hasSeenHousePart = false;
+    $addressPartCompleted = false;
+
+    foreach ($tokens as $token) {
+        $isLocality = in_array($token, $localityTypes);
+        $isStreet = in_array($token, $streetTypes);
+        $isHousePart = in_array($token, $housePartTypes);
+        $isMarker = in_array($token, $allMarkers);
+
+        $startNewAddress = false;
+        if (!empty($currentAddressParts)) {
+            if ($isLocality && ($hasSeenStreet || $hasSeenLocality)) {
+                $startNewAddress = true;
+            }
+            if ($addressPartCompleted && !$isMarker && $token !== ',') {
+                $startNewAddress = true;
+            }
+        }
+
+        if ($startNewAddress) {
+            $finalAddresses[] = buildAddress($prefix, $currentAddressParts);
+            $currentAddressParts = [];
+            $hasSeenLocality = false;
+            $hasSeenStreet = false;
+            $hasSeenHousePart = false;
+            $addressPartCompleted = false;
+        }
+
+        $currentAddressParts[] = $token;
+
+        if ($isLocality) $hasSeenLocality = true;
+        if ($isStreet) $hasSeenStreet = true;
+        if ($isHousePart) $hasSeenHousePart = true;
+        
+        if ($token === ',' && $hasSeenHousePart) {
+            $addressPartCompleted = true;
+        }
+    }
+
+    if (!empty($currentAddressParts)) {
+        $finalAddresses[] = buildAddress($prefix, $currentAddressParts);
+    }
+
+    return array_values(array_unique($finalAddresses));
 }
 
+function buildAddress(string $prefix, array $parts): string {
+    $address = $prefix . ' ' . implode(' ', $parts);
+    $address = trim($address);
+    $address = preg_replace('/\s*,\s*/', ', ', $address);
+    $address = preg_replace('/ ,/', ',', $address);
+    $address = preg_replace(['/\s*,\s*$/', '/\s+/'], ['', ' '], $address);
+    return $address;
+}
+
+// =============================================================================
+// ОСНОВНАЯ ЛОГИКА МИГРАЦИИ
+// =============================================================================
 echo "Запуск миграции структуры адресов...\n";
 logMigrate("=== Начало сеанса миграции ===");
 
@@ -99,7 +175,7 @@ try {
 
     $checkColumnStmt = $pdo->query("SHOW COLUMNS FROM `procurements` LIKE 'work_location'");
     if ($checkColumnStmt->rowCount() == 0) {
-        logMigrate("Старое поле 'work_location' не найдено. Миграция уже была выполнена.");
+        logMigrate("Старое поле 'work_location' не найдено. Похоже, миграция уже была выполнена.");
         logMigrate("=== Сеанс миграции завершен успешно ===");
         exit;
     }
@@ -150,7 +226,7 @@ try {
     logMigrate("\n=== Миграция успешно завершена! ===");
 
 } catch (Exception $e) {
-    if ($pdo->inTransaction()) {
+    if (isset($pdo) && $pdo->inTransaction()) {
         $pdo->rollBack();
     }
     logMigrate("\nОШИБКА! Миграция прервана. " . $e->getMessage());

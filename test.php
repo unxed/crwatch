@@ -90,17 +90,17 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
     $tokens = explode(' ', $preparedBlock);
     $logger->log("T:[" . implode('|', $tokens) . "]");
 
-    $majorLocalityTypes = ['г', 'с', 'п', 'рп', 'пгт', 'село', 'город', 'деревня', 'станица', 'поселок'];
+    $majorLocalityTypes = ['г', 'с', 'п', 'рп', 'пгт', 'село', 'город', 'деревня', 'станица', 'поселок', 'пос'];
     $subLocalityTypes = ['мкр', 'мкрн'];
     $localityTypes = array_merge($majorLocalityTypes, $subLocalityTypes);
-    $streetTypes = ['ул', 'улица', 'пр', 'пр-т', 'проспект', 'пер', 'переулок', 'наб', 'набережная', 'б-р', 'бульвар', 'площадь', 'пл', 'ш', 'шоссе', 'пр-д', 'проезд', 'линия', 'кан', 'тер'];
+    $streetTypes = ['ул', 'улица', 'пр', 'пр-т', 'проспект', 'пер', 'переулок', 'наб', 'набережная', 'б-р', 'бульвар', 'площадь', 'пл', 'ш', 'шоссе', 'пр-д', 'проезд', 'линия', 'кан', 'тер', 'дорога'];
     $housePartTypes = ['д', 'дом', 'корп', 'к', 'стр', 'строение', 'литера', 'лит'];
     $allMarkers = array_merge($localityTypes, $streetTypes, $housePartTypes);
 
     $prefix = '';
     $firstMarkerIndex = -1;
     foreach ($tokens as $i => $token) {
-        if (in_array(rtrim($token, '.'), $allMarkers)) {
+        if (in_array(mb_strtolower(rtrim($token, '.'), 'UTF-8'), $allMarkers)) {
             $firstMarkerIndex = $i;
             break;
         }
@@ -132,8 +132,31 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
     $hasSeenHousePart = false;
     $addressPartCompleted = false;
 
+    // Инициализация контекста из префикса
+    if (!empty($prefix)) {
+        $prefixTokens = explode(' ', str_replace(',', ' , ', $prefix));
+        $lastCommaPos = array_search(',', array_reverse($prefixTokens, true));
+        
+        // Берем часть после последней запятой или весь префикс, если запятых нет
+        $potentialContext = ($lastCommaPos !== false) ? array_slice($prefixTokens, $lastCommaPos + 1) : $prefixTokens;
+        $potentialContext = array_filter($potentialContext, 'trim'); // Убираем пустые элементы
+
+        if (!empty($potentialContext)) {
+            foreach ($potentialContext as $pToken) {
+                // Если в этой части есть маркер НП, считаем ее валидным контекстом
+                if (in_array(mb_strtolower(rtrim($pToken, '.'), 'UTF-8'), $localityTypes)) {
+                    $localityContextParts = $potentialContext;
+                    $localityContextIsValid = true;
+                    $hasSeenLocality = true;
+                    $logger->log("CTX_INIT_FROM_PREFIX: [" . implode('|', $localityContextParts) . "]");
+                    break;
+                }
+            }
+        }
+    }
+
     foreach ($tokens as $token) {
-        $cleanToken = rtrim($token, '.');
+        $cleanToken = mb_strtolower(rtrim($token, '.'), 'UTF-8');
         
         $isLocality = in_array($cleanToken, $localityTypes);
         $isMajorLocality = in_array($cleanToken, $majorLocalityTypes);
@@ -141,7 +164,6 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
         $isHousePart = in_array($cleanToken, $housePartTypes);
         $isMarker = $isLocality || $isStreet || $isHousePart;
 
-        // --- Логирование состояния ДО принятия решения ---
         $logLine = sprintf("'%s' | s:%d%d%d%d | c:%d[%s]",
             $token,
             (int)$hasSeenLocality, (int)$hasSeenStreet, (int)$hasSeenHousePart, (int)$addressPartCompleted,
@@ -172,7 +194,7 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
             $logLine .= " | a:=> \"" . $builtAddress . "\"";
             $finalAddresses[] = $builtAddress;
             
-            if ($splitReason === 1) { // splitByLocality
+            if ($splitReason === 1) {
                 $currentAddressParts = [];
                 $localityContextParts = [];
                 $localityContextIsValid = false;
@@ -194,16 +216,33 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
 
         $currentAddressParts[] = $token;
 
-        if ($isLocality) $hasSeenLocality = true;
-        if ($isStreet) $hasSeenStreet = true;
-        if ($isHousePart) $hasSeenHousePart = true;
+        // "Умная" фиксация контекста, если он еще не был установлен
+        if ($isStreet && !$hasSeenStreet && !$localityContextIsValid) {
+            $streetMarkerIndex = count($currentAddressParts) - 1;
+            $streetNameStartIndex = $streetMarkerIndex;
 
-        if (!$hasSeenStreet) {
-            $localityContextParts[] = $token;
-            if ($isLocality) {
+            while ($streetNameStartIndex > 0 && $currentAddressParts[$streetNameStartIndex - 1] !== ',') {
+                $streetNameStartIndex--;
+            }
+
+            $potentialContext = array_slice($currentAddressParts, 0, $streetNameStartIndex);
+            
+            $isNowValid = false;
+            foreach ($potentialContext as $part) {
+                if (in_array(mb_strtolower(rtrim($part, '.'), 'UTF-8'), $localityTypes)) {
+                    $isNowValid = true;
+                    break;
+                }
+            }
+            if ($isNowValid) {
+                $localityContextParts = $potentialContext;
                 $localityContextIsValid = true;
             }
         }
+
+        if ($isLocality) $hasSeenLocality = true;
+        if ($isStreet) $hasSeenStreet = true;
+        if ($isHousePart) $hasSeenHousePart = true;
 
         if ($token === ',' && $hasSeenHousePart) {
             $addressPartCompleted = true;
@@ -242,18 +281,14 @@ $humanLogFp = fopen('human_log.txt', 'w');
 foreach ($testCases as $name => $data) {
     $sectionHeader = "================= ЗАПУСК ТЕСТА: $name =================\n";
     
-    // Пишем в оба лога и в консоль
     echo "\n" . $sectionHeader;
     $aiLogger->section($name);
     fwrite($humanLogFp, $sectionHeader);
     
-    // Пишем исходные данные в человеческий лог
     fwrite($humanLogFp, "ИСХОДНЫЕ ДАННЫЕ:\n" . $data . "\n\n");
 
-    // Запускаем обработку
     $result = splitAddresses($data, $aiLogger);
 
-    // Пишем результат в человеческий лог и в консоль
     $resultHeader = "--- РЕЗУЛЬТАТ РАЗБИВКИ (" . count($result) . " адресов) ---\n";
     echo $resultHeader;
     fwrite($humanLogFp, $resultHeader);

@@ -395,8 +395,6 @@ function buildAddress(string $prefix, array $parts): string {
     $address = preg_replace('/\s*,\s*/', ', ', $address);
     $address = preg_replace('/ ,/', ',', $address);
     $address = preg_replace(['/\s*,\s*$/', '/\s+/'], ['', ' '], ' ' . $address);
-
-    $address = preg_replace('/Российская Федерация,/', '', $address);
     return trim($address);
 }
 
@@ -425,6 +423,8 @@ foreach ($testCases as $name => $data) {
     fwrite($humanLogFp, $resultHeader);
 
     foreach ($result as $address) {
+        $address = preg_replace('/Российская Федерация,?\s?/', '', $address);
+
         $line = "- " . $address . "\n";
         echo $line;
         fwrite($humanLogFp, $line);

@@ -36,7 +36,6 @@ class AiLogger
     }
 }
 
-
 function splitAddresses(string $addressBlock, AiLogger $logger): array
 {
     if (empty(trim($addressBlock))) {
@@ -98,7 +97,6 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
                 $partTokens = explode(' ', $part);
                 $majorLocalityMarkers = array_merge($regionTypes, $baseMajorLocalityTypes, $districtTypes);
                 foreach ($partTokens as $token) {
-                    // v36.0 (Bug 20): FIX - Очищаем токен и от запятых, а не только от точек
                     if (in_array(mb_strtolower(rtrim($token, '.,'), 'UTF-8'), $majorLocalityMarkers)) {
                         $isAlreadyFull = true;
                         $logger->log("Part \"$part\" is considered a full address (found marker: \"$token\").");
@@ -147,13 +145,18 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
     $groupSeparators = ['го:', 'мр:'];
 
     $minTokensForHeuristic = 20;
-    $maxMarkerRatioForText = 0.05;
     $heuristicMarkers = array_diff($allMarkers, ['с', 'к', 'п']);
 
     $heuristicTokens = explode(' ', preg_replace(['/\s+/', '/([,.])\1+/'], [' ', '$1'], $addressBlock));
     $tokenCount = count($heuristicTokens);
 
     if ($tokenCount > $minTokensForHeuristic) {
+        // =============================================================================
+        // FIX START: Улучшенная двухуровневая эвристика
+        // =============================================================================
+        $maxMarkerRatioForText = 0.05; // Порог, ниже которого это скорее всего текст
+        $minMarkerRatioToOverride = 0.10; // Порог, выше которого это точно адреса, и другие эвристики не нужны
+
         $markerCount = 0;
         foreach ($heuristicTokens as $token) {
             if (in_array(mb_strtolower(rtrim($token, '.,:'), 'UTF-8'), $heuristicMarkers)) {
@@ -161,15 +164,40 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
             }
         }
         $markerRatio = ($tokenCount > 0) ? $markerCount / $tokenCount : 0;
-        
-        $logger->log(sprintf("HEURISTIC_CHECK: Tokens=%d, Markers=%d, Ratio=%.3f (Threshold %.2f)", $tokenCount, $markerCount, $markerRatio, $maxMarkerRatioForText));
+        $logger->log(sprintf("HEURISTIC_CHECK: Tokens=%d, Markers=%d, Ratio=%.3f", $tokenCount, $markerCount, $markerRatio));
 
-        if ($markerRatio < $maxMarkerRatioForText) {
-            $logger->log("HEURISTIC_PASS: Ratio is below threshold. Returning as single text block.");
-            return [$addressBlock];
+        // 1. Если плотность маркеров высокая, это точно список адресов. Пропускаем остальные проверки.
+        if ($markerRatio >= $minMarkerRatioToOverride) {
+            $logger->log(sprintf("HEURISTIC_FAIL: Marker ratio (%.3f) is high (>= %.2f). Assuming address list, proceeding to FSM.", $markerRatio, $minMarkerRatioToOverride));
         } else {
-            $logger->log("HEURISTIC_FAIL: Ratio is high enough. Proceeding to FSM.");
+            // 2. Плотность маркеров низкая или средняя. Применяем дополнительные проверки для отсеивания текста.
+            
+            // 2a. Проверка на длинные слова (для случаев, когда ratio чуть выше порога, как в "мусор после обл")
+            $longWordLengthThreshold = 12;
+            $longWordCountThreshold = 3;
+            $longWordCount = 0;
+            foreach ($heuristicTokens as $token) {
+                if (mb_strlen(trim($token, '.,:()«»"\''), 'UTF-8') >= $longWordLengthThreshold) {
+                    $longWordCount++;
+                }
+            }
+
+            if ($longWordCount > $longWordCountThreshold) {
+                $logger->log(sprintf("HEURISTIC_PASS (Long Words): Found %d words >= %d chars with medium/low marker ratio. Returning as single text block.", $longWordCount, $longWordLengthThreshold));
+                return [$addressBlock];
+            }
+
+            // 2b. Финальная проверка на очень низкое соотношение маркеров
+            if ($markerRatio < $maxMarkerRatioForText) {
+                $logger->log(sprintf("HEURISTIC_PASS (Low Ratio): Ratio %.3f is below threshold %.2f. Returning as single text block.", $markerRatio, $maxMarkerRatioForText));
+                return [$addressBlock];
+            }
+            
+            $logger->log("HEURISTIC_FAIL: Ratio is not high, but other text heuristics did not trigger. Proceeding to FSM.");
         }
+        // =============================================================================
+        // FIX END
+        // =============================================================================
     } else {
         $logger->log(sprintf("HEURISTIC_SKIP: Token count (%d) is not above threshold (%d). Proceeding to FSM.", $tokenCount, $minTokensForHeuristic));
     }

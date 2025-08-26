@@ -11,312 +11,421 @@ function logMigrate(string $message): void {
 // АЛГОРИТМ РАЗДЕЛЕНИЯ АДРЕСОВ
 // =============================================================================
 
+const LEVEL_COUNTRY = 0;
+const LEVEL_REGION = 1;
+const LEVEL_DISTRICT = 2;
+const LEVEL_CITY = 3;
+const LEVEL_STREET = 4;
+const LEVEL_HOUSE = 5;
+
+// --- ФУНКЦИИ-ПОМОЩНИКИ, НЕОБХОДИМЫЕ ДЛЯ РАБОТЫ ПАРСЕРА ---
+
+function containsDigits(string $str): bool
+{
+    return strcspn($str, '0123456789') !== strlen($str);
+}
+
+function findNumericListMarker(string $chunk): ?int
+{
+    $len = mb_strlen($chunk);
+    for ($i = 1; $i < $len; $i++) {
+        $char = mb_substr($chunk, $i, 1);
+        if ($char === ')') {
+            $prevChar = mb_substr($chunk, $i - 1, 1);
+            if (is_numeric($prevChar)) {
+                $startPos = $i - 1;
+                while ($startPos > 0 && is_numeric(mb_substr($chunk, $startPos - 1, 1))) {
+                    $startPos--;
+                }
+                $beforeChar = mb_substr($chunk, $startPos - 1, 1);
+                if ($beforeChar === ' ') {
+                    return $startPos;
+                }
+            }
+        }
+    }
+    return null;
+}
+
+function replaceLastWord(string $haystack, string $newWord): string
+{
+    $lastSpacePos = mb_strrpos($haystack, ' ');
+    if ($lastSpacePos === false) {
+        return $newWord;
+    }
+    $base = mb_substr($haystack, 0, $lastSpacePos);
+    return $base . ' ' . $newWord;
+}
+
+function removeLeadingNoise(string $chunk): string
+{
+    $originalChunk = $chunk;
+    $cursor = 0;
+    $len = mb_strlen($chunk);
+    while ($cursor < $len && mb_substr($chunk, $cursor, 1) === ' ') $cursor++;
+    $digitStart = $cursor;
+    while ($cursor < $len && is_numeric(mb_substr($chunk, $cursor, 1))) $cursor++;
+    if ($cursor > $digitStart) {
+        if ($cursor < $len && in_array(mb_substr($chunk, $cursor, 1), ['.', ')'])) {
+            $cursor++;
+            while ($cursor < $len && mb_substr($chunk, $cursor, 1) === ' ') $cursor++;
+            $result = mb_substr($chunk, $cursor);
+            if ($originalChunk !== '' && $result === '') {
+                return $originalChunk;
+            }
+            return $result;
+        }
+    }
+    return $chunk;
+}
+
+function findMarkerInChunk(string $chunk, array $markers, array $currentAddressParts): ?array
+{
+    foreach ($markers as $marker => $level) {
+        $pos = mb_stripos($chunk, $marker);
+        if ($pos !== false) {
+            $markerLen = mb_strlen($marker);
+            $before = ($pos > 0) ? mb_substr($chunk, $pos - 1, 1) : ' ';
+            $isAfterOk = false;
+            if ($pos + $markerLen >= mb_strlen($chunk)) {
+                $isAfterOk = true;
+            } else {
+                $after = mb_substr($chunk, $pos + $markerLen, 1);
+                if (in_array($after, [' ', '.', ')', '/']) || is_numeric($after)) {
+                    $isAfterOk = true;
+                }
+            }
+            
+            if (in_array($before, [' ', '(']) && $isAfterOk) {
+                if ($marker === 'г' || $marker === 'г.') {
+                    if ($pos > 0) {
+                        $chunkBeforeMarker = trim(mb_substr($chunk, 0, $pos));
+                        if (!empty($chunkBeforeMarker) && is_numeric(mb_substr($chunkBeforeMarker, -1))) {
+                            continue;
+                        }
+                    }
+                }
+
+                $currentLevel = $level;
+                if ($marker === 'д.') {
+                    $hasStreetLevel = isset($currentAddressParts[LEVEL_STREET]);
+                    $chunkWithoutMarker = trim(str_ireplace('д.', '', $chunk));
+                    if ($hasStreetLevel && containsDigits($chunkWithoutMarker)) {
+                         $currentLevel = LEVEL_HOUSE;
+                    } else {
+                         $currentLevel = LEVEL_CITY;
+                    }
+                }
+                return ['marker' => $marker, 'level' => $currentLevel, 'pos' => $pos];
+            }
+        }
+    }
+    return null;
+}
+
+function containsHouseKeyword(string $str): bool
+{
+    $houseKeywords = ['литер', 'корп', 'строение', 'стр', 'к.'];
+    foreach ($houseKeywords as $keyword) {
+        if (mb_stripos($str, $keyword) !== false) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function isHouseComponent(string $component): bool
+{
+    $junkHouseKeywords = ['позиция', 'объект', 'многоквартирные'];
+     foreach ($junkHouseKeywords as $keyword) {
+        if (mb_stripos($component, $keyword) !== false) {
+            return false;
+        }
+    }
+
+    if (containsHouseKeyword($component)) return true;
+    
+    $hasDigits = containsDigits($component);
+    
+    // Используем preg_match только для проверки наличия символа, а не для парсинга.
+    $hasLetters = preg_match('/\p{L}/u', $component) > 0;
+
+    if (!$hasDigits && $hasLetters) {
+        if (mb_strlen(trim($component)) === 1) {
+            return true;
+        }
+        return false;
+    }
+
+    return $hasDigits || $hasLetters;
+}
+
 /**
- * Разделяет блок текста на отдельные адреса, используя сложную логику
- * на основе конечного автомата для сохранения контекста.
- *
- * @param string $addressBlock Входной блок текста с адресами.
- * @return array Массив строк, где каждая строка - отдельный адрес.
+ * Разделяет текстовый блок, содержащий один или несколько адресов, на массив отдельных адресов.
+ * Функция спроектирована для работы с "грязными" данными без использования регулярных выражений и токенизации.
+ * 
+ * @param string $addressBlock Входная строка с одним или несколькими адресами.
+ * @return array Массив извлеченных адресов. Если не удалось извлечь более одного адреса с указанием дома,
+ *               возвращает массив, содержащий исходную строку.
  */
 function splitAddresses(string $addressBlock): array
 {
-    if (empty(trim($addressBlock))) {
-        return [];
+    $markersConfig = [
+        'Российская Федерация' => LEVEL_COUNTRY,
+        'обл' => LEVEL_REGION, 'область' => LEVEL_REGION, 'край' => LEVEL_REGION, 'Респ' => LEVEL_REGION, 'республика' => LEVEL_REGION, 'АО' => LEVEL_REGION,
+        'р-н' => LEVEL_DISTRICT, 'район' => LEVEL_DISTRICT, 'ГО:' => LEVEL_DISTRICT, 'МР:' => LEVEL_DISTRICT, 'округ' => LEVEL_DISTRICT,
+        'г.' => LEVEL_CITY, 'г' => LEVEL_CITY, 'город' => LEVEL_CITY, 'с.' => LEVEL_CITY, 'село' => LEVEL_CITY, 'п.' => LEVEL_CITY, 'п' => LEVEL_CITY, 'пос.' => LEVEL_CITY, 'поселок' => LEVEL_CITY, 'р. п.' => LEVEL_CITY, 'р.п.' => LEVEL_CITY, 'д.' => LEVEL_CITY,
+        'квл' => LEVEL_STREET, 'наб.кан.' => LEVEL_STREET, 'кан.' => LEVEL_STREET, 'ул.' => LEVEL_STREET, 'ул' => LEVEL_STREET, 'улица' => LEVEL_STREET, 'пр-т' => LEVEL_STREET, 'пр.' => LEVEL_STREET, 'пр-кт' => LEVEL_STREET, 'проспект' => LEVEL_STREET, 'б-р' => LEVEL_STREET, 'б-р.' => LEVEL_STREET, 'бульвар' => LEVEL_STREET, 'пер.' => LEVEL_STREET, 'переулок' => LEVEL_STREET, 'наб.' => LEVEL_STREET, 'набережная' => LEVEL_STREET, 'ш.' => LEVEL_STREET, 'шоссе' => LEVEL_STREET, 'проезд' => LEVEL_STREET, 'линия' => LEVEL_STREET, 'дорога' => LEVEL_STREET, 'мкрн.' => LEVEL_STREET, 'мкрн' => LEVEL_STREET, 'микрорайон' => LEVEL_STREET,
+        'д.' => LEVEL_HOUSE, 'дом' => LEVEL_HOUSE, 'корп.' => LEVEL_HOUSE, 'корп' => LEVEL_HOUSE, 'к.' => LEVEL_HOUSE, 'корпус' => LEVEL_HOUSE, 'стр.' => LEVEL_HOUSE, 'строение' => LEVEL_HOUSE, 'литера' => LEVEL_HOUSE, 'лит.' => LEVEL_HOUSE,
+    ];
+    uksort($markersConfig, function ($a, $b) { return mb_strlen($b) - mb_strlen($a); });
+    $markers = $markersConfig;
+    $markerlessKeywords = ['Санкт-Петербург' => LEVEL_CITY, 'Москва' => LEVEL_CITY, 'Севастополь' => LEVEL_CITY];
+    
+    $results = []; 
+    $currentAddressParts = []; 
+    $lastLevel = -1;
+    $foundAtLeastOneHouse = false;
+    $lastHouseComponent = null;
+    $inParenthesesMode = false;
+    
+    $cursor = 0;
+    $length = mb_strlen($addressBlock);
+    $delimiters = [',', ';', "\n"];
+    $processingQueue = [];
+
+    while ($cursor < $length) {
+        $nextPos = $length;
+        foreach ($delimiters as $d) {
+            $pos = mb_strpos($addressBlock, $d, $cursor);
+            if ($pos !== false) $nextPos = min($nextPos, $pos);
+        }
+        $chunk = trim(mb_substr($addressBlock, $cursor, $nextPos - $cursor));
+        if ($chunk !== '') $processingQueue[] = $chunk;
+        $cursor = $nextPos + 1; 
     }
 
-    $addressBlock = trim($addressBlock);
-
-    // Предварительная очистка от конструкций типа "(п.п. 1; 2)"
-    $addressBlock = preg_replace('/\s*\(\s*(п\.\s*(п\.\s*)?)\s*.*?\)/ui', '', $addressBlock);
-    
-    // Исправление сокращения "р. п." в "рп."
-    $addressBlock = preg_replace('/р\.\s*п\./i', 'рп.', $addressBlock);
-
-    // Словари маркеров адресных частей
-    $regionTypes = ['обл', 'респ', 'край', 'ао'];
-    $baseMajorLocalityTypes = ['г', 'с', 'п', 'рп', 'пгт', 'село', 'город', 'деревня', 'станица', 'поселок', 'пос'];
-    $districtTypes = ['р-н', 'район'];
-    $subLocalityTypes = ['мкр', 'мкрн'];
-    $streetTypes = ['ул', 'улица', 'пр', 'пр-т', 'проспект', 'пер', 'переулок', 'наб', 'набережная', 'б-р', 'бульвар', 'площадь', 'пл', 'ш', 'шоссе', 'пр-д', 'проезд', 'линия', 'кан', 'тер', 'дорога'];
-    $housePartTypes = ['д', 'дом', 'корп', 'к', 'стр', 'строение', 'литера', 'лит'];
-
-    // Обработка многократных вхождений "Российская Федерация"
-    $delimiter = 'Российская Федерация';
-    if (substr_count(mb_strtolower($addressBlock), mb_strtolower($delimiter)) > 1) {
-        $parts = preg_split("/(" . preg_quote($delimiter, '/') . ")/i", $addressBlock, -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY);
-        $addresses = [];
-        $currentAddress = '';
-        foreach ($parts as $part) {
-            if (mb_strtolower(trim($part)) === mb_strtolower($delimiter)) {
-                if (!empty(trim($currentAddress))) {
-                    $addresses = array_merge($addresses, splitAddresses(trim($currentAddress)));
+    while (!empty($processingQueue)) {
+        $chunk = array_shift($processingQueue);
+        
+        if ($inParenthesesMode) {
+            $lastKey = !empty($currentAddressParts) ? array_key_last($currentAddressParts) : null;
+            if ($lastKey !== null) {
+                $currentAddressParts[$lastKey] .= '; ' . $chunk;
+            }
+            if (mb_strpos($chunk, ')') !== false) {
+                $inParenthesesMode = false;
+                if($lastKey === LEVEL_HOUSE) {
+                    $lastHouseComponent = $currentAddressParts[$lastKey];
                 }
-                $currentAddress = $part;
+            }
+            continue;
+        }
+
+        $numericMarkerPos = findNumericListMarker($chunk);
+        if ($numericMarkerPos !== null) {
+            $part1 = trim(mb_substr($chunk, 0, $numericMarkerPos));
+            $part2 = trim(mb_substr($chunk, $numericMarkerPos));
+            if ($part2 !== '') array_unshift($processingQueue, $part2);
+            if ($part1 !== '') array_unshift($processingQueue, $part1);
+            continue;
+        }
+        
+        $colonPos = mb_strpos($chunk, ':');
+        if ($colonPos !== false) {
+            $chunk = trim(mb_substr($chunk, $colonPos + 1));
+            if (empty($chunk)) {
+                continue;
+            }
+        }
+        
+        $cleanComponent = removeLeadingNoise($chunk);
+
+        $markerInfo = findMarkerInChunk($cleanComponent, $markers, $currentAddressParts);
+        $pos = $markerInfo['pos'] ?? -1;
+        if ($pos > 0) {
+            $part1 = trim(mb_substr($cleanComponent, 0, $pos));
+            if ($markerInfo['level'] < LEVEL_STREET && isHouseComponent($part1)) {
+                $part2 = trim(mb_substr($cleanComponent, $pos));
+                array_unshift($processingQueue, $part2);
+                array_unshift($processingQueue, $part1);
+                continue;
+            }
+        }
+        
+        $currentLevel = null;
+        foreach ($markerlessKeywords as $keyword => $level) {
+            if (mb_strtolower($cleanComponent) == mb_strtolower($keyword)) {
+                $currentLevel = $level;
+                break;
+            }
+        }
+        if ($currentLevel === null) {
+            $markerInfo = findMarkerInChunk($cleanComponent, $markers, $currentAddressParts);
+            if ($markerInfo) {
+                $currentLevel = $markerInfo['level'];
             } else {
-                $currentAddress .= $part;
-            }
-        }
-        if (!empty(trim($currentAddress))) {
-            $addresses = array_merge($addresses, splitAddresses(trim($currentAddress)));
-        }
-        return array_values(array_unique($addresses));
-    }
-    
-    // Эвристика для отличения списка адресов от обычного текста
-    $addressPartStarters = array_merge($baseMajorLocalityTypes, $districtTypes, $subLocalityTypes, $streetTypes, $housePartTypes);
-    $allMarkers = array_merge($regionTypes, $addressPartStarters);
-    $minTokensForHeuristic = 20;
-    $heuristicMarkers = array_diff($allMarkers, ['с', 'к', 'п']);
-    $heuristicTokens = explode(' ', preg_replace(['/\s+/', '/([,.])\1+/'], [' ', '$1'], $addressBlock));
-    $tokenCount = count($heuristicTokens);
+                $combined = false;
+                if (!empty($processingQueue)) {
+                    $nextChunk = $processingQueue[0];
+                    $nextChunkClean = trim($nextChunk, ' .');
+                    foreach ($markers as $marker => $level) {
+                        if (trim($marker, ' .') === $nextChunkClean) {
+                            $shouldCombine = false;
+                            if ($level >= $lastLevel) {
+                                $shouldCombine = true;
+                            } else if (mb_strpos(trim($cleanComponent), ' ') === false && !containsDigits($cleanComponent)) {
+                                $shouldCombine = true;
+                            }
 
-    if ($tokenCount > $minTokensForHeuristic) {
-        $maxMarkerRatioForText = 0.05;
-        $minMarkerRatioToOverride = 0.10;
-
-        $markerCount = 0;
-        foreach ($heuristicTokens as $token) {
-            if (in_array(mb_strtolower(rtrim($token, '.,:'), 'UTF-8'), $heuristicMarkers)) {
-                $markerCount++;
-            }
-        }
-        $markerRatio = ($tokenCount > 0) ? $markerCount / $tokenCount : 0;
-
-        if ($markerRatio < $minMarkerRatioToOverride) {
-            $longWordLengthThreshold = 12;
-            $longWordCountThreshold = 3;
-            $longWordCount = 0;
-            foreach ($heuristicTokens as $token) {
-                if (mb_strlen(trim($token, '.,:()«»"\''), 'UTF-8') >= $longWordLengthThreshold) {
-                    $longWordCount++;
+                            if ($shouldCombine) {
+                                $namePart = $cleanComponent;
+                                $typePart = array_shift($processingQueue);
+                                $cleanComponent = $namePart . ' ' . $typePart;
+                                $currentLevel = $level;
+                                $combined = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!$combined) {
+                    if ($lastLevel === LEVEL_HOUSE && mb_strlen($cleanComponent) <= 2) {
+                        $currentLevel = LEVEL_HOUSE;
+                    } else if (isHouseComponent($cleanComponent)) {
+                        $currentLevel = LEVEL_HOUSE;
+                    } else {
+                        continue;
+                    }
                 }
             }
+        }
+        
+        if ($currentLevel === LEVEL_HOUSE) {
+            $foundAtLeastOneHouse = true;
+        }
 
-            if ($longWordCount > $longWordCountThreshold || $markerRatio < $maxMarkerRatioForText) {
-                return [$addressBlock];
+        $isNewAddress = ($lastLevel !== -1 && $currentLevel <= $lastLevel);
+        $newHousePartFromHanging = null; 
+
+        if ($isNewAddress && $currentLevel == LEVEL_HOUSE && $lastLevel == LEVEL_HOUSE) {
+            $isSupplementToHouse = true;
+            $markerInfo = findMarkerInChunk($cleanComponent, $markers, $currentAddressParts);
+            $houseMarkers = ['д.', 'дом'];
+            if ($markerInfo && in_array($markerInfo['marker'], $houseMarkers)) {
+                $isSupplementToHouse = false;
+            }
+            if ($isSupplementToHouse) {
+                if (containsHouseKeyword($cleanComponent)) {
+                    $isNewAddress = false;
+                } else {
+                    if ($lastHouseComponent) {
+                         $newHousePartFromHanging = replaceLastWord($lastHouseComponent, $cleanComponent);
+                    }
+                }
             }
         }
-    }
+        if ($isNewAddress) {
+            $builtAddress = '';
+            if (!empty($currentAddressParts) && (isset($currentAddressParts[LEVEL_STREET]) || isset($currentAddressParts[LEVEL_HOUSE]))) {
+                 ksort($currentAddressParts);
+                 $builtAddress = implode(', ', $currentAddressParts);
+            }
+            
+            if ($builtAddress && (empty($results) || end($results) !== $builtAddress)) {
+                 $results[] = $builtAddress;
+            }
 
-    // Подготовка к работе конечного автомата (FSM)
-    $addressBlock = preg_replace(['/\s+/', '/([,.])\1+/'], [' ', '$1'], $addressBlock);
-    $preparedBlock = str_replace([',', ';'], [' , ', ' ; '], $addressBlock);
-    $preparedBlock = preg_replace('~(\S\.)([^\s.])~u', '$1 $2', $preparedBlock);
-    $preparedBlock = trim(preg_replace('/\s+/', ' ', $preparedBlock));
-    $tokens = explode(' ', $preparedBlock);
-
-    $prefixLocalityMarkers = $baseMajorLocalityTypes;
-    $allPrefixMarkers = array_merge($prefixLocalityMarkers, $subLocalityTypes, $streetTypes, $housePartTypes);
-
-    // Определение общего префикса (например, "Российская Федерация, Московская обл,")
-    $prefix = '';
-    $firstMarkerIndex = -1;
-    foreach ($tokens as $i => $token) {
-        if (in_array(mb_strtolower(rtrim($token, '.'), 'UTF-8'), $addressPartStarters)) {
-            $firstMarkerIndex = $i;
-            break;
+            $newParts = [];
+            if ($currentLevel == LEVEL_HOUSE && $lastLevel == LEVEL_HOUSE) {
+                foreach ($currentAddressParts as $lvl => $part) {
+                    if ($lvl < LEVEL_HOUSE) $newParts[$lvl] = $part;
+                }
+            } else {
+                foreach ($currentAddressParts as $lvl => $part) {
+                    if ($lvl < $currentLevel) $newParts[$lvl] = $part;
+                }
+            }
+            $currentAddressParts = $newParts;
         }
-    }
-
-    if ($firstMarkerIndex != -1) {
-        $startIndex = $firstMarkerIndex;
-        while ($startIndex > 0 && !in_array($tokens[$startIndex - 1], [',', ';'])) {
-            $startIndex--;
+        
+        if ($newHousePartFromHanging !== null) {
+            $currentAddressParts[LEVEL_HOUSE] = $newHousePartFromHanging;
+            $lastHouseComponent = $newHousePartFromHanging;
+        } else if ($currentLevel == LEVEL_HOUSE && isset($currentAddressParts[LEVEL_HOUSE]) && !$isNewAddress) {
+            $currentAddressParts[LEVEL_HOUSE] .= ', ' . $cleanComponent;
+            $lastHouseComponent = $currentAddressParts[LEVEL_HOUSE];
+        } else {
+            foreach($currentAddressParts as $lvl => $part) {
+                if ($lvl >= $currentLevel) unset($currentAddressParts[$lvl]);
+            }
+            $currentAddressParts[$currentLevel] = $cleanComponent;
+            if ($currentLevel === LEVEL_HOUSE) {
+                $lastHouseComponent = $cleanComponent;
+            }
         }
-        if ($startIndex > 0) {
-            $prefixTokens = array_slice($tokens, 0, $startIndex);
-            $prefix = implode(' ', $prefixTokens);
-            $tokens = array_slice($tokens, $startIndex);
-        }
-    } else {
-        return [buildAddress($prefix, $tokens)];
-    }
+        
+        $lastLevel = $currentLevel;
 
-    // Инициализация FSM
-    $finalAddresses = [];
-    $currentAddressParts = [];
-    $localityContextParts = [];
-    $localityContextIsValid = false;
-    $hasSeenLocality = false;
-    $hasSeenStreet = false;
-    $hasSeenHousePart = false;
-    $addressPartCompleted = false;
-    $partJustFinished = false;
-    $previousCleanToken = '';
-    $groupSeparators = ['го:', 'мр:'];
-
-    // Инициализация контекста из префикса, если возможно
-    if (!empty($prefix)) {
-        $prefixTokens = explode(' ', str_replace([',', ';'], [' , ', ' ; '], $prefix));
-        $lastCommaPos = array_search(',', array_reverse($prefixTokens, true));
-        $potentialContext = ($lastCommaPos !== false) ? array_slice($prefixTokens, $lastCommaPos + 1) : $prefixTokens;
-        $potentialContext = array_filter($potentialContext, 'trim');
-
-        if (!empty($potentialContext)) {
-            foreach ($potentialContext as $pToken) {
-                if (in_array(mb_strtolower(rtrim($pToken, '.'), 'UTF-8'), array_merge($baseMajorLocalityTypes, $districtTypes, $subLocalityTypes))) {
-                    $localityContextParts = $potentialContext;
-                    $localityContextIsValid = true;
-                    $hasSeenLocality = true;
+        if ($currentLevel === LEVEL_STREET) {
+            $houseMarkersForSplit = [' д.', ' дом '];
+            foreach ($houseMarkersForSplit as $houseMarker) {
+                $housePos = mb_stripos($currentAddressParts[LEVEL_STREET], $houseMarker);
+                if ($housePos !== false) {
+                    $streetPart = trim(mb_substr($currentAddressParts[LEVEL_STREET], 0, $housePos));
+                    $housePart = trim(mb_substr($currentAddressParts[LEVEL_STREET], $housePos));
+                    $currentAddressParts[LEVEL_STREET] = $streetPart;
+                    array_unshift($processingQueue, $housePart);
                     break;
                 }
             }
         }
+
+        if ($currentLevel === LEVEL_STREET) {
+            $houseMarkersForSplit = [' д.', ' дом '];
+            foreach ($houseMarkersForSplit as $houseMarker) {
+                $housePos = mb_stripos($currentAddressParts[LEVEL_STREET], $houseMarker);
+                if ($housePos !== false) {
+                    $streetPart = trim(mb_substr($currentAddressParts[LEVEL_STREET], 0, $housePos));
+                    $housePart = trim(mb_substr($currentAddressParts[LEVEL_STREET], $housePos));
+                    
+                    log_ai("Post-split: Found house marker '{$houseMarker}' in street component. Splitting.");
+                    $currentAddressParts[LEVEL_STREET] = $streetPart;
+                    array_unshift($processingQueue, $housePart);
+                    log_ai("New street part: '{$streetPart}'. Re-queuing house part: '{$housePart}'.");
+                    break;
+                }
+            }
+        }
+
+        if (mb_strpos($cleanComponent, '(') !== false && mb_strpos($cleanComponent, ')') === false) {
+            $inParenthesesMode = true;
+        }
     }
-
-    // Основной цикл FSM
-    foreach ($tokens as $token) {
-        if (trim($token) === ';') {
-            if (!empty(array_filter($currentAddressParts, 'trim'))) {
-                $finalAddresses[] = buildAddress($prefix, $currentAddressParts);
-                $currentAddressParts = $localityContextIsValid ? $localityContextParts : [];
-                $hasSeenLocality = $localityContextIsValid;
-                $hasSeenStreet = false;
-                $hasSeenHousePart = false;
-                $addressPartCompleted = false;
-                $partJustFinished = false;
-            }
-            continue;
-        }
-
-        $cleanTokenWithColon = mb_strtolower($token, 'UTF-8');
-        $cleanToken = mb_strtolower(rtrim($token, '.'), 'UTF-8');
-
-        if (in_array($cleanTokenWithColon, $groupSeparators)) {
-            if (!empty(array_filter($currentAddressParts, 'trim'))) {
-                $finalAddresses[] = buildAddress($prefix, $currentAddressParts);
-            }
-            $currentAddressParts = [];
-            $localityContextParts = [];
-            $localityContextIsValid = false;
-            $hasSeenLocality = $hasSeenStreet = $hasSeenHousePart = $addressPartCompleted = $partJustFinished = false;
-            continue;
-        }
-        
-        $isDistrict = in_array($cleanToken, $districtTypes);
-        $isMajorDistrict = $isDistrict && !$hasSeenStreet;
-        $isSubDistrict = $isDistrict && $hasSeenStreet;
-        $isBaseMajorLocality = in_array($cleanToken, $baseMajorLocalityTypes);
-        $isMajorLocality = $isBaseMajorLocality || $isMajorDistrict;
-        $isSubLocality = in_array($cleanToken, $subLocalityTypes) || $isSubDistrict;
-        $isLocality = $isMajorLocality || $isSubLocality;
-        $isStreet = in_array($cleanToken, $streetTypes);
-        $isHousePart = in_array($cleanToken, $housePartTypes);
-        $isMarker = $isLocality || $isStreet || $isHousePart;
-        $looksLikeHouseContinuation = (bool)preg_match('/^(\d+|[а-я])$/ui', $cleanToken);
-
-        $startNewAddress = false;
-        $splitReason = 0;
-
-        if (!empty($currentAddressParts)) {
-            if (in_array($cleanToken, $prefixLocalityMarkers) && $hasSeenLocality) {
-                $startNewAddress = true;
-                $splitReason = 1;
-            }
-            if (!$startNewAddress && $partJustFinished && $token !== ',' && !$isMarker) {
-                if (!in_array($previousCleanToken, $allPrefixMarkers)) {
-                    $startNewAddress = true;
-                    $splitReason = 4;
-                }
-            }
-            if (!$startNewAddress && $addressPartCompleted && ($isStreet || $isLocality || (!$isMarker && $token !== ',' && !$looksLikeHouseContinuation))) {
-                 $startNewAddress = true;
-                 $splitReason = 2;
-            }
-            if (!$startNewAddress && $isStreet && $hasSeenHousePart) {
-                $startNewAddress = true;
-                $splitReason = 3;
-            }
-        }
-        
-        if ($startNewAddress) {
-            $finalAddresses[] = buildAddress($prefix, $currentAddressParts);
-            if ($splitReason === 1 || ($splitReason === 2 && $isLocality)) {
-                $currentAddressParts = [];
-                $localityContextParts = [];
-                $localityContextIsValid = false;
-                $hasSeenLocality = false;
-            } else {
-                $currentAddressParts = $localityContextIsValid ? $localityContextParts : [];
-                $hasSeenLocality = $localityContextIsValid;
-            }
-            $hasSeenStreet = false;
-            $hasSeenHousePart = false;
-            $addressPartCompleted = false;
-            $partJustFinished = false; 
-        }
-        
-        $currentAddressParts[] = $token;
-
-        if (($isLocality || $isStreet) && !$localityContextIsValid) {
-            $markerIndex = count($currentAddressParts) - 1;
-            $nameStartIndex = $markerIndex;
-            while ($nameStartIndex > 0 && !in_array($currentAddressParts[$nameStartIndex - 1], [',', ';'])) {
-                $nameStartIndex--;
-            }
-            $potentialContext = array_slice($currentAddressParts, 0, $nameStartIndex);
-            $potentialContext = array_filter($potentialContext, fn($t) => trim($t) !== '');
-            
-            if (!empty($potentialContext)) {
-                $isNowValid = false;
-                foreach ($potentialContext as $part) {
-                    if (in_array(mb_strtolower(rtrim($part, '.'), 'UTF-8'), array_merge($baseMajorLocalityTypes, $districtTypes, $subLocalityTypes))) {
-                        $isNowValid = true;
-                        break;
-                    }
-                }
-                if ($isNowValid) {
-                    $localityContextParts = $potentialContext;
-                    $localityContextIsValid = true;
-                }
-            }
-        }
-
-        if ($isMarker) {
-            $partJustFinished = true;
-        } elseif ($token !== ',') {
-            $partJustFinished = false;
-        }
-        
-        if ($isLocality) $hasSeenLocality = true;
-        if ($isStreet) {
-            $hasSeenStreet = true;
-            $hasSeenHousePart = false;
-            $addressPartCompleted = false;
-        }
-        if ($isHousePart) {
-            $hasSeenHousePart = true;
-            $addressPartCompleted = false;
-        }
-        if ($token === ',' && $hasSeenHousePart) {
-            $addressPartCompleted = true;
-        }
-        
-        $previousCleanToken = $cleanToken;
+    if (!empty($currentAddressParts) && (isset($currentAddressParts[LEVEL_STREET]) || isset($currentAddressParts[LEVEL_HOUSE]))) {
+        ksort($currentAddressParts);
+        $results[] = implode(', ', $currentAddressParts);
     }
-
-    if (!empty($currentAddressParts)) {
-        $finalAddresses[] = buildAddress($prefix, $currentAddressParts);
+    $finalResults = [];
+    foreach ($results as $address) {
+        $junkKeywords = ['объектами культурного наследия', 'технического состояния', 'Место выполнения работ'];
+        $isJunk = false;
+        foreach ($junkKeywords as $keyword) {
+            if (mb_stristr($address, $keyword)) {
+                $isJunk = true; break;
+            }
+        }
+        if (!$isJunk) $finalResults[] = $address;
     }
     
-    return array_values(array_unique(array_filter($finalAddresses))); 
-}
+    $finalResults = array_unique($finalResults);
+    $finalResults = array_values($finalResults);
 
-/**
- * Вспомогательная функция для сборки и очистки строки адреса.
- *
- * @param string $prefix Общий префикс для всех адресов.
- * @param array $parts Массив токенов текущего адреса.
- * @return string Готовая строка адреса.
- */
-function buildAddress(string $prefix, array $parts): string {
-    $address = trim($prefix . ' ' . implode(' ', $parts));
-    $address = preg_replace('/\s*,\s*/', ', ', $address);
-    $address = preg_replace('/ ,/', ',', $address);
-    $address = preg_replace(['/\s*,\s*$/', '/\s+/'], ['', ' '], ' ' . $address);
-
-    $address = preg_replace('/Российская Федерация,/', '', $address);
-    return trim($address);
+    if (count($finalResults) <= 1 || !$foundAtLeastOneHouse) {
+        return [$addressBlock];
+    }
+    
+    return $finalResults;
 }
 
 // =============================================================================
@@ -363,7 +472,7 @@ try {
     }
     
     logMigrate("2. Извлечение закупок для обработки...");
-    $stmt = $pdo->query("SELECT id, work_location FROM procurements WHERE work_location IS NOT NULL AND work_location != ''");
+    $stmt = $pdo->query("SELECT id, work_location FROM procurements WHERE work_location IS NOT NULL AND work_location != '' ORDER BY id");
     $procurements = $stmt->fetchAll(PDO::FETCH_ASSOC);
     $total = count($procurements);
 
@@ -392,7 +501,7 @@ try {
                 }
             }
             $processed++;
-            printf("\rОбработано закупок: %d/%d | Перенесено адресов: %d", $processed, $total, $totalAddresses);
+            printf("\rОбработано закупок: %d/%d | Перенесено адресов: %d | last id: %d", $processed, $total, $totalAddresses, $proc['id']);
         }
         $pdo->commit();
         logMigrate("\nПеренос завершен. Всего перенесено $totalAddresses отдельных адресов.");

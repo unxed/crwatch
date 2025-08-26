@@ -46,15 +46,76 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
     $logger->log("I:\"" . $addressBlock . "\"");
 
     $addressBlock = trim($addressBlock);
+
+    $addressBlock = preg_replace('/\s*\(\s*(п\.\s*(п\.\s*)?)\s*.*?\)/ui', '', $addressBlock);
+    
     $addressBlock = preg_replace('/р\.\s*п\./i', 'рп.', $addressBlock);
+
+    $regionTypes = ['обл', 'респ', 'край', 'ао'];
+    $baseMajorLocalityTypes = ['г', 'с', 'п', 'рп', 'пгт', 'село', 'город', 'деревня', 'станица', 'поселок', 'пос'];
+    $districtTypes = ['р-н', 'район'];
+    $subLocalityTypes = ['мкр', 'мкрн'];
+    $streetTypes = ['ул', 'улица', 'пр', 'пр-т', 'проспект', 'пер', 'переулок', 'наб', 'набережная', 'б-р', 'бульвар', 'площадь', 'пл', 'ш', 'шоссе', 'пр-д', 'проезд', 'линия', 'кан', 'тер', 'дорога'];
+    $housePartTypes = ['д', 'дом', 'корп', 'к', 'стр', 'строение', 'литера', 'лит'];
 
     $parts = preg_split('/[;\r\n]+/', $addressBlock);
     if (count($parts) > 1) {
-        $logger->log("SPLIT_PRIMARY: " . count($parts));
+        $logger->log("SPLIT_PRIMARY_CONTEXTUAL: " . count($parts));
         $allAddresses = [];
-        foreach ($parts as $part) {
-            $allAddresses = array_merge($allAddresses, splitAddresses(trim($part), $logger));
+        
+        $firstPartAddresses = splitAddresses(trim($parts[0]), $logger);
+        if (empty($firstPartAddresses)) {
+            for ($i = 1; $i < count($parts); $i++) {
+                 $allAddresses = array_merge($allAddresses, splitAddresses(trim($parts[$i]), $logger));
+            }
+            return array_values(array_unique($allAddresses));
         }
+
+        $allAddresses = array_merge($allAddresses, $firstPartAddresses);
+        $firstFullAddress = end($firstPartAddresses);
+
+        $parentContext = '';
+        $streetPattern = implode('|', array_map(function($t) { return preg_quote($t, '/'); }, $streetTypes));
+        $regex = '/^(.*?),\s*(?:\S+\s+)?\b(?:' . $streetPattern . ')\b\.?.*/iu';
+        
+        $streetFoundInFirst = preg_match($regex, $firstFullAddress, $matches);
+
+        if ($streetFoundInFirst) {
+            $parentContext = trim($matches[1], " ,");
+            $logger->log("CONTEXT_EXTRACTED (from full addr): \"" . $parentContext . "\"");
+        } else {
+            $parentContext = $firstFullAddress;
+            array_pop($allAddresses);
+            $logger->log("CONTEXT_EXTRACTED (as context-only): \"" . $parentContext . "\"");
+        }
+
+        if (!empty($parentContext)) {
+            for ($i = 1; $i < count($parts); $i++) {
+                $part = trim($parts[$i]);
+                if (empty($part)) continue;
+                
+                $isAlreadyFull = false;
+                $partTokens = explode(' ', $part);
+                $majorLocalityMarkers = array_merge($regionTypes, $baseMajorLocalityTypes, $districtTypes);
+                foreach ($partTokens as $token) {
+                    // v36.0 (Bug 20): FIX - Очищаем токен и от запятых, а не только от точек
+                    if (in_array(mb_strtolower(rtrim($token, '.,'), 'UTF-8'), $majorLocalityMarkers)) {
+                        $isAlreadyFull = true;
+                        $logger->log("Part \"$part\" is considered a full address (found marker: \"$token\").");
+                        break;
+                    }
+                }
+
+                $addressToProcess = $isAlreadyFull ? $part : $parentContext . ', ' . $part;
+                $logger->log("CONTEXT_APPLY: Processing \"" . $addressToProcess . "\"");
+                $allAddresses = array_merge($allAddresses, splitAddresses($addressToProcess, $logger));
+            }
+        } else {
+             for ($i = 1; $i < count($parts); $i++) {
+                 $allAddresses = array_merge($allAddresses, splitAddresses(trim($parts[$i]), $logger));
+            }
+        }
+
         return array_values(array_unique($allAddresses));
     }
 
@@ -79,18 +140,10 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
         }
         return array_values(array_unique($addresses));
     }
-
-    $regionTypes = ['обл', 'респ', 'край', 'ао'];
-    $baseMajorLocalityTypes = ['г', 'с', 'п', 'рп', 'пгт', 'село', 'город', 'деревня', 'станица', 'поселок', 'пос'];
-    $districtTypes = ['р-н', 'район'];
-    $subLocalityTypes = ['мкр', 'мкрн'];
-    $streetTypes = ['ул', 'улица', 'пр', 'пр-т', 'проспект', 'пер', 'переулок', 'наб', 'набережная', 'б-р', 'бульвар', 'площадь', 'пл', 'ш', 'шоссе', 'пр-д', 'проезд', 'линия', 'кан', 'тер', 'дорога'];
-    $housePartTypes = ['д', 'дом', 'корп', 'к', 'стр', 'строение', 'литера', 'лит'];
     
     $addressPartStarters = array_merge($baseMajorLocalityTypes, $districtTypes, $subLocalityTypes, $streetTypes, $housePartTypes);
     $allMarkers = array_merge($regionTypes, $addressPartStarters);
 
-    // v30.0: Явный список групповых разделителей
     $groupSeparators = ['го:', 'мр:'];
 
     $minTokensForHeuristic = 20;
@@ -194,7 +247,6 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
         $cleanTokenWithColon = mb_strtolower($token, 'UTF-8');
         $cleanToken = mb_strtolower(rtrim($token, '.'), 'UTF-8');
 
-        // --- v30.0: Улучшенная обработка групповых разделителей ---
         if (in_array($cleanTokenWithColon, $groupSeparators)) {
             $logger->log("'$token' | Group separator found.");
             if (!empty(array_filter($currentAddressParts, 'trim'))) {
@@ -202,14 +254,12 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
                 $finalAddresses[] = $builtAddress;
                 $logger->log("FINALIZED_BY_SEPARATOR: \"" . $builtAddress . "\"");
             }
-            // Полный сброс состояния для нового списка
             $currentAddressParts = [];
             $localityContextParts = [];
             $localityContextIsValid = false;
             $hasSeenLocality = $hasSeenStreet = $hasSeenHousePart = $addressPartCompleted = $partJustFinished = false;
-            continue; // Пропускаем сам маркер (ГО:, МР:)
+            continue;
         }
-        // --- Конец блока v30.0 ---
         
         $isDistrict = in_array($cleanToken, $districtTypes);
         $isMajorDistrict = $isDistrict && !$hasSeenStreet;
@@ -224,11 +274,14 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
         $isHousePart = in_array($cleanToken, $housePartTypes);
         $isMarker = $isLocality || $isStreet || $isHousePart;
 
-        $logLine = sprintf("'%s' | s:%d%d%d%d p:%d | c:%d[%s]",
+        $looksLikeHouseContinuation = (bool)preg_match('/^(\d+|[а-я])$/ui', $cleanToken);
+
+        $logLine = sprintf("'%s' | s:%d%d%d%d p:%d | c:%d[%s] hc:%d",
             $token,
             (int)$hasSeenLocality, (int)$hasSeenStreet, (int)$hasSeenHousePart, (int)$addressPartCompleted,
             (int)$partJustFinished,
-            (int)$localityContextIsValid, implode('|', $localityContextParts)
+            (int)$localityContextIsValid, implode('|', $localityContextParts),
+            (int)$looksLikeHouseContinuation
         );
 
         $startNewAddress = false;
@@ -249,7 +302,7 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
                 }
             }
 
-            if (!$startNewAddress && $addressPartCompleted && ($isStreet || $isLocality || (!$isMarker && $token !== ','))) {
+            if (!$startNewAddress && $addressPartCompleted && ($isStreet || $isLocality || (!$isMarker && $token !== ',' && !$looksLikeHouseContinuation))) {
                  $startNewAddress = true;
                  $splitReason = 2;
             }

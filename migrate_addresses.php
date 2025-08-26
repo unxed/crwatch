@@ -11,6 +11,12 @@ function logMigrate(string $message): void {
 // АЛГОРИТМ РАЗДЕЛЕНИЯ АДРЕСОВ
 // =============================================================================
 
+/**
+ * Разделяет текстовый блок на отдельные адреса, обрабатывая различные форматы списков и вложенные структуры.
+ *
+ * @param string $addressBlock Входной текстовый блок с адресами.
+ * @return array Массив строк, где каждая строка - это отдельный, полный адрес.
+ */
 function splitAddresses(string $addressBlock): array
 {
     if (empty(trim($addressBlock))) {
@@ -18,17 +24,82 @@ function splitAddresses(string $addressBlock): array
     }
 
     $addressBlock = trim($addressBlock);
+
+    // Предварительная очистка: удаление служебных конструкций типа (п.1)
+    $addressBlock = preg_replace('/\s*\(\s*(п\.\s*(п\.\s*)?)\s*.*?\)/ui', '', $addressBlock);
+    // Предварительная нормализация: "р. п." -> "рп."
     $addressBlock = preg_replace('/р\.\s*п\./i', 'рп.', $addressBlock);
 
+    // Определения типов маркеров, необходимые для логики контекста и FSM
+    $regionTypes = ['обл', 'респ', 'край', 'ао'];
+    $baseMajorLocalityTypes = ['г', 'с', 'п', 'рп', 'пгт', 'село', 'город', 'деревня', 'станица', 'поселок', 'пос'];
+    $districtTypes = ['р-н', 'район'];
+    $subLocalityTypes = ['мкр', 'мкрн'];
+    $streetTypes = ['ул', 'улица', 'пр', 'пр-т', 'проспект', 'пер', 'переулок', 'наб', 'набережная', 'б-р', 'бульвар', 'площадь', 'пл', 'ш', 'шоссе', 'пр-д', 'проезд', 'линия', 'кан', 'тер', 'дорога'];
+    $housePartTypes = ['д', 'дом', 'корп', 'к', 'стр', 'строение', 'литера', 'лит'];
+
+    // Интеллектуальная обработка списков, разделенных точкой с запятой или переносом строки
     $parts = preg_split('/[;\r\n]+/', $addressBlock);
     if (count($parts) > 1) {
         $allAddresses = [];
-        foreach ($parts as $part) {
-            $allAddresses = array_merge($allAddresses, splitAddresses(trim($part)));
+        
+        $firstPartAddresses = splitAddresses(trim($parts[0]));
+        if (empty($firstPartAddresses)) {
+            // Если первая часть пуста, обрабатываем остальные независимо
+            for ($i = 1; $i < count($parts); $i++) {
+                 $allAddresses = array_merge($allAddresses, splitAddresses(trim($parts[$i])));
+            }
+            return array_values(array_unique($allAddresses));
         }
+
+        $allAddresses = array_merge($allAddresses, $firstPartAddresses);
+        $firstFullAddress = end($firstPartAddresses);
+
+        $parentContext = '';
+        $streetPattern = implode('|', array_map(function($t) { return preg_quote($t, '/'); }, $streetTypes));
+        $regex = '/^(.*?),\s*(?:\S+\s+)?\b(?:' . $streetPattern . ')\b\.?.*/iu';
+        
+        $streetFoundInFirst = preg_match($regex, $firstFullAddress, $matches);
+
+        if ($streetFoundInFirst) {
+            // Сценарий А: Первая часть - полный адрес с улицей. Извлекаем контекст.
+            $parentContext = trim($matches[1], " ,");
+        } else {
+            // Сценарий Б: В первой части нет улицы. Считаем, что ВСЯ она - это контекст.
+            // Она НЕ является самостоятельным адресом, поэтому удаляем ее из результатов.
+            $parentContext = $firstFullAddress;
+            array_pop($allAddresses);
+        }
+
+        if (!empty($parentContext)) {
+            for ($i = 1; $i < count($parts); $i++) {
+                $part = trim($parts[$i]);
+                if (empty($part)) continue;
+                
+                $isAlreadyFull = false;
+                $partTokens = explode(' ', $part);
+                $majorLocalityMarkers = array_merge($regionTypes, $baseMajorLocalityTypes, $districtTypes);
+                foreach ($partTokens as $token) {
+                    // v36.0: Очищаем токен и от запятых, а не только от точек
+                    if (in_array(mb_strtolower(rtrim($token, '.,'), 'UTF-8'), $majorLocalityMarkers)) {
+                        $isAlreadyFull = true;
+                        break;
+                    }
+                }
+
+                $addressToProcess = $isAlreadyFull ? $part : $parentContext . ', ' . $part;
+                $allAddresses = array_merge($allAddresses, splitAddresses($addressToProcess));
+            }
+        } else {
+             for ($i = 1; $i < count($parts); $i++) {
+                 $allAddresses = array_merge($allAddresses, splitAddresses(trim($parts[$i])));
+            }
+        }
+
         return array_values(array_unique($allAddresses));
     }
 
+    // Разделение по "Российская Федерация", если встречается несколько раз
     $delimiter = 'Российская Федерация';
     if (substr_count(mb_strtolower($addressBlock), mb_strtolower($delimiter)) > 1) {
         $parts = preg_split("/(" . preg_quote($delimiter, '/') . ")/i", $addressBlock, -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY);
@@ -49,19 +120,13 @@ function splitAddresses(string $addressBlock): array
         }
         return array_values(array_unique($addresses));
     }
-
-    $regionTypes = ['обл', 'респ', 'край', 'ао'];
-    $baseMajorLocalityTypes = ['г', 'с', 'п', 'рп', 'пгт', 'село', 'город', 'деревня', 'станица', 'поселок', 'пос'];
-    $districtTypes = ['р-н', 'район'];
-    $subLocalityTypes = ['мкр', 'мкрн'];
-    $streetTypes = ['ул', 'улица', 'пр', 'пр-т', 'проспект', 'пер', 'переулок', 'наб', 'набережная', 'б-р', 'бульвар', 'площадь', 'пл', 'ш', 'шоссе', 'пр-д', 'проезд', 'линия', 'кан', 'тер', 'дорога'];
-    $housePartTypes = ['д', 'дом', 'корп', 'к', 'стр', 'строение', 'литера', 'лит'];
     
     $addressPartStarters = array_merge($baseMajorLocalityTypes, $districtTypes, $subLocalityTypes, $streetTypes, $housePartTypes);
     $allMarkers = array_merge($regionTypes, $addressPartStarters);
 
     $groupSeparators = ['го:', 'мр:'];
 
+    // Эвристический фильтр для отсеивания не-адресных текстовых блоков
     $minTokensForHeuristic = 20;
     $maxMarkerRatioForText = 0.05;
     $heuristicMarkers = array_diff($allMarkers, ['с', 'к', 'п']);
@@ -83,6 +148,7 @@ function splitAddresses(string $addressBlock): array
         }
     }
 
+    // Подготовка к FSM
     $addressBlock = preg_replace(['/\s+/', '/([,.])\1+/'], [' ', '$1'], $addressBlock);
     $preparedBlock = str_replace(',', ' , ', $addressBlock);
     $preparedBlock = preg_replace('~(\S\.)([^\s.])~u', '$1 $2', $preparedBlock);
@@ -92,6 +158,7 @@ function splitAddresses(string $addressBlock): array
     $prefixLocalityMarkers = $baseMajorLocalityTypes;
     $allPrefixMarkers = array_merge($prefixLocalityMarkers, $subLocalityTypes, $streetTypes, $housePartTypes);
 
+    // Определение префикса (часть до первого адресного маркера)
     $prefix = '';
     $firstMarkerIndex = -1;
     foreach ($tokens as $i => $token) {
@@ -115,6 +182,7 @@ function splitAddresses(string $addressBlock): array
         return [buildAddress($prefix, $tokens)];
     }
 
+    // Инициализация конечного автомата (FSM)
     $finalAddresses = [];
     $currentAddressParts = [];
     
@@ -130,7 +198,6 @@ function splitAddresses(string $addressBlock): array
     if (!empty($prefix)) {
         $prefixTokens = explode(' ', str_replace(',', ' , ', $prefix));
         $lastCommaPos = array_search(',', array_reverse($prefixTokens, true));
-        
         $potentialContext = ($lastCommaPos !== false) ? array_slice($prefixTokens, $lastCommaPos + 1) : $prefixTokens;
         $potentialContext = array_filter($potentialContext, 'trim');
 
@@ -146,14 +213,14 @@ function splitAddresses(string $addressBlock): array
         }
     }
 
+    // Основной цикл FSM
     foreach ($tokens as $token) {
         $cleanTokenWithColon = mb_strtolower($token, 'UTF-8');
         $cleanToken = mb_strtolower(rtrim($token, '.'), 'UTF-8');
 
         if (in_array($cleanTokenWithColon, $groupSeparators)) {
             if (!empty(array_filter($currentAddressParts, 'trim'))) {
-                $builtAddress = buildAddress($prefix, $currentAddressParts);
-                $finalAddresses[] = $builtAddress;
+                $finalAddresses[] = buildAddress($prefix, $currentAddressParts);
             }
             $currentAddressParts = [];
             $localityContextParts = [];
@@ -175,6 +242,8 @@ function splitAddresses(string $addressBlock): array
         $isHousePart = in_array($cleanToken, $housePartTypes);
         $isMarker = $isLocality || $isStreet || $isHousePart;
 
+        $looksLikeHouseContinuation = (bool)preg_match('/^(\d+|[а-я])$/ui', $cleanToken);
+
         $startNewAddress = false;
         $splitReason = 0;
 
@@ -191,7 +260,7 @@ function splitAddresses(string $addressBlock): array
                 }
             }
 
-            if (!$startNewAddress && $addressPartCompleted && ($isStreet || $isLocality || (!$isMarker && $token !== ','))) {
+            if (!$startNewAddress && $addressPartCompleted && ($isStreet || $isLocality || (!$isMarker && $token !== ',' && !$looksLikeHouseContinuation))) {
                  $startNewAddress = true;
                  $splitReason = 2;
             }
@@ -202,8 +271,7 @@ function splitAddresses(string $addressBlock): array
         }
         
         if ($startNewAddress) {
-            $builtAddress = buildAddress($prefix, $currentAddressParts);
-            $finalAddresses[] = $builtAddress;
+            $finalAddresses[] = buildAddress($prefix, $currentAddressParts);
             
             if ($splitReason === 1 || ($splitReason === 2 && $isLocality)) {
                 $currentAddressParts = [];
@@ -280,6 +348,13 @@ function splitAddresses(string $addressBlock): array
     return array_values(array_unique(array_filter($finalAddresses))); 
 }
 
+/**
+ * Вспомогательная функция для сборки и очистки строки адреса из префикса и массива частей.
+ *
+ * @param string $prefix Префиксная часть адреса (регион, город).
+ * @param array $parts Массив токенов локальной части адреса (улица, дом).
+ * @return string Отформатированная и очищенная строка адреса.
+ */
 function buildAddress(string $prefix, array $parts): string {
     $address = trim($prefix . ' ' . implode(' ', $parts));
     $address = preg_replace('/\s*,\s*/', ', ', $address);

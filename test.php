@@ -395,6 +395,8 @@ function buildAddress(string $prefix, array $parts): string {
     $address = preg_replace('/\s*,\s*/', ', ', $address);
     $address = preg_replace('/ ,/', ',', $address);
     $address = preg_replace(['/\s*,\s*$/', '/\s+/'], ['', ' '], ' ' . $address);
+
+    $address = preg_replace('/Российская Федерация,/', '', $address);
     return trim($address);
 }
 

@@ -51,22 +51,18 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
     $addressBlock = preg_replace('/р\.\s*п\./i', 'рп.', $addressBlock);
 
     $regionTypes = ['обл', 'респ', 'край', 'ао'];
-    $baseMajorLocalityTypes = ['г', 'с', 'п', 'рп', 'пгт', 'село', 'город', 'деревня', 'станица', 'поселок', 'пос', 'д'];
+    $baseMajorLocalityTypes = ['г', 'с', 'п', 'рп', 'пгт', 'село', 'город', 'деревня', 'станица', 'поселок', 'пос'];
     $districtTypes = ['р-н', 'район'];
     $subLocalityTypes = ['мкр', 'мкрн'];
     $streetTypes = ['ул', 'улица', 'пр', 'пр-т', 'проспект', 'пер', 'переулок', 'наб', 'набережная', 'б-р', 'бульвар', 'площадь', 'пл', 'ш', 'шоссе', 'пр-д', 'проезд', 'линия', 'кан', 'тер', 'дорога'];
     $housePartTypes = ['д', 'дом', 'корп', 'к', 'стр', 'строение', 'литера', 'лит'];
 
-    $semicolonMeansHouseContinuation = false;
-    $houseTypesPattern = implode('|', array_map(fn($t) => preg_quote($t, '/'), $housePartTypes));
-    $houseContinuationPattern = '/;\s*\b(?:' . $houseTypesPattern . ')\b\.?\s+\d/ui';
-
-    if (preg_match($houseContinuationPattern, $addressBlock)) {
-        $semicolonMeansHouseContinuation = true;
-        $logger->log("SEMICOLON_MODE: Detected as house continuation.");
-    } else {
-        $logger->log("SEMICOLON_MODE: Detected as full address separator.");
-    }
+    // =============================================================================
+    // ИЗМЕНЕНИЕ: Полностью удален блок предварительного разделения по точке с запятой.
+    // Вся логика теперь находится внутри FSM.
+    // =============================================================================
+    // $parts = preg_split('/[;\r\n]+/', $addressBlock);
+    // if (count($parts) > 1) { ... }
 
     $delimiter = 'Российская Федерация';
     if (substr_count(mb_strtolower($addressBlock), mb_strtolower($delimiter)) > 1) {
@@ -92,9 +88,12 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
     
     $addressPartStarters = array_merge($baseMajorLocalityTypes, $districtTypes, $subLocalityTypes, $streetTypes, $housePartTypes);
     $allMarkers = array_merge($regionTypes, $addressPartStarters);
+
     $groupSeparators = ['го:', 'мр:'];
+
     $minTokensForHeuristic = 20;
     $heuristicMarkers = array_diff($allMarkers, ['с', 'к', 'п']);
+
     $heuristicTokens = explode(' ', preg_replace(['/\s+/', '/([,.])\1+/'], [' ', '$1'], $addressBlock));
     $tokenCount = count($heuristicTokens);
 
@@ -142,6 +141,9 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
     $logger->log("FSM_S");
     
     $addressBlock = preg_replace(['/\s+/', '/([,.])\1+/'], [' ', '$1'], $addressBlock);
+    // =============================================================================
+    // ИЗМЕНЕНИЕ: Добавляем точку с запятой в список символов для токенизации
+    // =============================================================================
     $preparedBlock = str_replace([',', ';'], [' , ', ' ; '], $addressBlock);
     $preparedBlock = preg_replace('~(\S\.)([^\s.])~u', '$1 $2', $preparedBlock);
     $preparedBlock = trim(preg_replace('/\s+/', ' ', $preparedBlock));
@@ -150,6 +152,7 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
 
     $prefixLocalityMarkers = $baseMajorLocalityTypes;
     $allPrefixMarkers = array_merge($prefixLocalityMarkers, $subLocalityTypes, $streetTypes, $housePartTypes);
+
     $prefix = '';
     $firstMarkerIndex = -1;
     foreach ($tokens as $i => $token) {
@@ -161,7 +164,7 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
 
     if ($firstMarkerIndex != -1) {
         $startIndex = $firstMarkerIndex;
-        while ($startIndex > 0 && !in_array($tokens[$startIndex - 1], [',', ';'])) {
+        while ($startIndex > 0 && !in_array($tokens[$startIndex - 1], [',', ';'])) { // ИЗМЕНЕНИЕ: Учитываем ';' при поиске префикса
             $startIndex--;
         }
         if ($startIndex > 0) {
@@ -177,6 +180,7 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
 
     $finalAddresses = [];
     $currentAddressParts = [];
+    
     $localityContextParts = [];
     $localityContextIsValid = false;
     $hasSeenLocality = false;
@@ -187,7 +191,7 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
     $previousCleanToken = '';
 
     if (!empty($prefix)) {
-        $prefixTokens = explode(' ', str_replace([',', ';'], [' , ', ' ; '], $prefix));
+        $prefixTokens = explode(' ', str_replace([',', ';'], [' , ', ' ; '], $prefix)); // ИЗМЕНЕНИЕ: Учитываем ';'
         $lastCommaPos = array_search(',', array_reverse($prefixTokens, true));
         
         $potentialContext = ($lastCommaPos !== false) ? array_slice($prefixTokens, $lastCommaPos + 1) : $prefixTokens;
@@ -207,46 +211,25 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
     }
 
     foreach ($tokens as $token) {
+        // =============================================================================
+        // ИЗМЕНЕНИЕ: Добавлен блок обработки точки с запятой как разделителя адресов
+        // =============================================================================
         if (trim($token) === ';') {
+            $logger->log("';' | Semicolon found. Finalizing address.");
             if (!empty(array_filter($currentAddressParts, 'trim'))) {
                 $builtAddress = buildAddress($prefix, $currentAddressParts);
                 $finalAddresses[] = $builtAddress;
-                
-                if ($semicolonMeansHouseContinuation) {
-                    $logger->log("';' | Semicolon (house mode). Finalized: \"$builtAddress\"");
-                    
-                    $lastHouseMarkerIndex = -1;
-                    foreach (array_reverse($currentAddressParts, true) as $index => $part) {
-                        if (in_array(mb_strtolower(rtrim($part, '.'), 'UTF-8'), $housePartTypes)) {
-                            $lastHouseMarkerIndex = $index;
-                            break;
-                        }
-                    }
+                $logger->log("FINALIZED_BY_SEMICOLON: \"" . $builtAddress . "\"");
 
-                    if ($lastHouseMarkerIndex !== -1) {
-                        $streetPartEndIndex = $lastHouseMarkerIndex;
-                        while ($streetPartEndIndex > 0 && !in_array($currentAddressParts[$streetPartEndIndex - 1], [',', ';'])) {
-                             $streetPartEndIndex--;
-                        }
-                        $currentAddressParts = array_slice($currentAddressParts, 0, $streetPartEndIndex);
-                        $logger->log("CONTEXT_KEPT (street): [" . implode('|', $currentAddressParts) . "]");
-                    } else {
-                        $currentAddressParts = $localityContextIsValid ? $localityContextParts : [];
-                    }
-                    $hasSeenHousePart = false;
-                    $addressPartCompleted = false;
-                    $partJustFinished = false;
-                } else {
-                    $logger->log("';' | Semicolon (full address mode). Finalized: \"$builtAddress\"");
-                    $currentAddressParts = $localityContextIsValid ? $localityContextParts : [];
-                    $hasSeenLocality = $localityContextIsValid;
-                    $hasSeenStreet = false;
-                    $hasSeenHousePart = false;
-                    $addressPartCompleted = false;
-                    $partJustFinished = false;
-                }
+                // Сброс для следующей части, сохраняя контекст населенного пункта
+                $currentAddressParts = $localityContextIsValid ? $localityContextParts : [];
+                $hasSeenLocality = $localityContextIsValid;
+                $hasSeenStreet = false;
+                $hasSeenHousePart = false;
+                $addressPartCompleted = false;
+                $partJustFinished = false;
             }
-            continue;
+            continue; // Переходим к следующему токену
         }
 
         $cleanTokenWithColon = mb_strtolower($token, 'UTF-8');
@@ -269,62 +252,31 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
         $isDistrict = in_array($cleanToken, $districtTypes);
         $isMajorDistrict = $isDistrict && !$hasSeenStreet;
         $isSubDistrict = $isDistrict && $hasSeenStreet;
+
         $isBaseMajorLocality = in_array($cleanToken, $baseMajorLocalityTypes);
         $isMajorLocality = $isBaseMajorLocality || $isMajorDistrict;
         $isSubLocality = in_array($cleanToken, $subLocalityTypes) || $isSubDistrict;
         $isLocality = $isMajorLocality || $isSubLocality;
+
         $isStreet = in_array($cleanToken, $streetTypes);
         $isHousePart = in_array($cleanToken, $housePartTypes);
-
-        if ($cleanToken === 'д') {
-            if ($hasSeenStreet) {
-                $logger->log("AMBIGUOUS 'д': Context (hasSeenStreet=true) forces interpretation as 'дом'.");
-                $isBaseMajorLocality = false;
-                $isMajorLocality = $isMajorDistrict;
-                $isLocality = $isMajorLocality || $isSubLocality;
-            } else {
-                $logger->log("AMBIGUOUS 'д': Context (hasSeenStreet=false) forces interpretation as 'деревня'.");
-                $isHousePart = false;
-            }
-        }
-
-        // =============================================================================
-        // ИСПРАВЛЕНИЕ: Блок для корректной смены уличного контекста.
-        // Если найдена новая улица, а старая еще в "памяти", очищаем старую.
-        // =============================================================================
-        if ($isStreet && $hasSeenStreet) {
-            $logger->log("NEW_STREET_DETECTED: Discarding old street context before processing '$token'.");
-            $lastStreetMarkerIndex = -1;
-            foreach (array_reverse($currentAddressParts, true) as $index => $part) {
-                if (in_array(mb_strtolower(rtrim($part, '.'), 'UTF-8'), $streetTypes)) {
-                    $lastStreetMarkerIndex = $index;
-                    break;
-                }
-            }
-
-            if ($lastStreetMarkerIndex !== -1) {
-                $streetPartStartIndex = $lastStreetMarkerIndex;
-                while ($streetPartStartIndex > 0 && !in_array($currentAddressParts[$streetPartStartIndex - 1], [',', ';'])) {
-                     $streetPartStartIndex--;
-                }
-                $currentAddressParts = array_slice($currentAddressParts, 0, $streetPartStartIndex);
-                $logger->log("CONTEXT_RESET_TO_LOCALITY: [" . implode('|', $currentAddressParts) . "]");
-            }
-            // Сбрасываем флаги дома и улицы, чтобы начать сборку новой улицы с чистого листа
-            $hasSeenHousePart = false;
-            $hasSeenStreet = false; // Важно сбросить, чтобы он снова установился в true ниже
-        }
-        // =============================================================================
-
         $isMarker = $isLocality || $isStreet || $isHousePart;
+
         $looksLikeHouseContinuation = (bool)preg_match('/^(\d+|[а-я])$/ui', $cleanToken);
-        $logLine = sprintf("'%s' | s:%d%d%d%d p:%d | c:%d[%s] hc:%d", $token, (int)$hasSeenLocality, (int)$hasSeenStreet, (int)$hasSeenHousePart, (int)$addressPartCompleted, (int)$partJustFinished, (int)$localityContextIsValid, implode('|', $localityContextParts), (int)$looksLikeHouseContinuation);
+
+        $logLine = sprintf("'%s' | s:%d%d%d%d p:%d | c:%d[%s] hc:%d",
+            $token,
+            (int)$hasSeenLocality, (int)$hasSeenStreet, (int)$hasSeenHousePart, (int)$addressPartCompleted,
+            (int)$partJustFinished,
+            (int)$localityContextIsValid, implode('|', $localityContextParts),
+            (int)$looksLikeHouseContinuation
+        );
 
         $startNewAddress = false;
         $splitReason = 0;
 
         if (!empty($currentAddressParts)) {
-            if (in_array($cleanToken, $prefixLocalityMarkers) && $hasSeenLocality && !($cleanToken === 'д' && $hasSeenStreet)) {
+            if (in_array($cleanToken, $prefixLocalityMarkers) && $hasSeenLocality) {
                 $startNewAddress = true;
                 $splitReason = 1;
             }
@@ -382,7 +334,7 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
             $markerIndex = count($currentAddressParts) - 1;
             $nameStartIndex = $markerIndex;
 
-            while ($nameStartIndex > 0 && !in_array($currentAddressParts[$nameStartIndex - 1], [',', ';'])) {
+            while ($nameStartIndex > 0 && !in_array($currentAddressParts[$nameStartIndex - 1], [',', ';'])) { // ИЗМЕНЕНИЕ: Учитываем ';'
                 $nameStartIndex--;
             }
 

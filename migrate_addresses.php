@@ -384,6 +384,8 @@ try {
             
             foreach ($addresses as $address) {
                 if (!empty($address)) {
+                    $address = preg_replace('/Российская Федерация,/', '', $address);
+
                     $insertStmt = $pdo->prepare("INSERT INTO procurement_locations (procurement_id, address) VALUES (:proc_id, :addr)");
                     $insertStmt->execute([':proc_id' => $proc['id'], ':addr' => $address]);
                     $totalAddresses++;

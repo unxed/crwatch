@@ -57,65 +57,12 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
     $streetTypes = ['ул', 'улица', 'пр', 'пр-т', 'проспект', 'пер', 'переулок', 'наб', 'набережная', 'б-р', 'бульвар', 'площадь', 'пл', 'ш', 'шоссе', 'пр-д', 'проезд', 'линия', 'кан', 'тер', 'дорога'];
     $housePartTypes = ['д', 'дом', 'корп', 'к', 'стр', 'строение', 'литера', 'лит'];
 
-    $parts = preg_split('/[;\r\n]+/', $addressBlock);
-    if (count($parts) > 1) {
-        $logger->log("SPLIT_PRIMARY_CONTEXTUAL: " . count($parts));
-        $allAddresses = [];
-        
-        $firstPartAddresses = splitAddresses(trim($parts[0]), $logger);
-        if (empty($firstPartAddresses)) {
-            for ($i = 1; $i < count($parts); $i++) {
-                 $allAddresses = array_merge($allAddresses, splitAddresses(trim($parts[$i]), $logger));
-            }
-            return array_values(array_unique($allAddresses));
-        }
-
-        $allAddresses = array_merge($allAddresses, $firstPartAddresses);
-        $firstFullAddress = end($firstPartAddresses);
-
-        $parentContext = '';
-        $streetPattern = implode('|', array_map(function($t) { return preg_quote($t, '/'); }, $streetTypes));
-        $regex = '/^(.*?),\s*(?:\S+\s+)?\b(?:' . $streetPattern . ')\b\.?.*/iu';
-        
-        $streetFoundInFirst = preg_match($regex, $firstFullAddress, $matches);
-
-        if ($streetFoundInFirst) {
-            $parentContext = trim($matches[1], " ,");
-            $logger->log("CONTEXT_EXTRACTED (from full addr): \"" . $parentContext . "\"");
-        } else {
-            $parentContext = $firstFullAddress;
-            array_pop($allAddresses);
-            $logger->log("CONTEXT_EXTRACTED (as context-only): \"" . $parentContext . "\"");
-        }
-
-        if (!empty($parentContext)) {
-            for ($i = 1; $i < count($parts); $i++) {
-                $part = trim($parts[$i]);
-                if (empty($part)) continue;
-                
-                $isAlreadyFull = false;
-                $partTokens = explode(' ', $part);
-                $majorLocalityMarkers = array_merge($regionTypes, $baseMajorLocalityTypes, $districtTypes);
-                foreach ($partTokens as $token) {
-                    if (in_array(mb_strtolower(rtrim($token, '.,'), 'UTF-8'), $majorLocalityMarkers)) {
-                        $isAlreadyFull = true;
-                        $logger->log("Part \"$part\" is considered a full address (found marker: \"$token\").");
-                        break;
-                    }
-                }
-
-                $addressToProcess = $isAlreadyFull ? $part : $parentContext . ', ' . $part;
-                $logger->log("CONTEXT_APPLY: Processing \"" . $addressToProcess . "\"");
-                $allAddresses = array_merge($allAddresses, splitAddresses($addressToProcess, $logger));
-            }
-        } else {
-             for ($i = 1; $i < count($parts); $i++) {
-                 $allAddresses = array_merge($allAddresses, splitAddresses(trim($parts[$i]), $logger));
-            }
-        }
-
-        return array_values(array_unique($allAddresses));
-    }
+    // =============================================================================
+    // ИЗМЕНЕНИЕ: Полностью удален блок предварительного разделения по точке с запятой.
+    // Вся логика теперь находится внутри FSM.
+    // =============================================================================
+    // $parts = preg_split('/[;\r\n]+/', $addressBlock);
+    // if (count($parts) > 1) { ... }
 
     $delimiter = 'Российская Федерация';
     if (substr_count(mb_strtolower($addressBlock), mb_strtolower($delimiter)) > 1) {
@@ -151,11 +98,8 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
     $tokenCount = count($heuristicTokens);
 
     if ($tokenCount > $minTokensForHeuristic) {
-        // =============================================================================
-        // FIX START: Улучшенная двухуровневая эвристика
-        // =============================================================================
-        $maxMarkerRatioForText = 0.05; // Порог, ниже которого это скорее всего текст
-        $minMarkerRatioToOverride = 0.10; // Порог, выше которого это точно адреса, и другие эвристики не нужны
+        $maxMarkerRatioForText = 0.05;
+        $minMarkerRatioToOverride = 0.10;
 
         $markerCount = 0;
         foreach ($heuristicTokens as $token) {
@@ -166,13 +110,9 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
         $markerRatio = ($tokenCount > 0) ? $markerCount / $tokenCount : 0;
         $logger->log(sprintf("HEURISTIC_CHECK: Tokens=%d, Markers=%d, Ratio=%.3f", $tokenCount, $markerCount, $markerRatio));
 
-        // 1. Если плотность маркеров высокая, это точно список адресов. Пропускаем остальные проверки.
         if ($markerRatio >= $minMarkerRatioToOverride) {
             $logger->log(sprintf("HEURISTIC_FAIL: Marker ratio (%.3f) is high (>= %.2f). Assuming address list, proceeding to FSM.", $markerRatio, $minMarkerRatioToOverride));
         } else {
-            // 2. Плотность маркеров низкая или средняя. Применяем дополнительные проверки для отсеивания текста.
-            
-            // 2a. Проверка на длинные слова (для случаев, когда ratio чуть выше порога, как в "мусор после обл")
             $longWordLengthThreshold = 12;
             $longWordCountThreshold = 3;
             $longWordCount = 0;
@@ -187,7 +127,6 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
                 return [$addressBlock];
             }
 
-            // 2b. Финальная проверка на очень низкое соотношение маркеров
             if ($markerRatio < $maxMarkerRatioForText) {
                 $logger->log(sprintf("HEURISTIC_PASS (Low Ratio): Ratio %.3f is below threshold %.2f. Returning as single text block.", $markerRatio, $maxMarkerRatioForText));
                 return [$addressBlock];
@@ -195,9 +134,6 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
             
             $logger->log("HEURISTIC_FAIL: Ratio is not high, but other text heuristics did not trigger. Proceeding to FSM.");
         }
-        // =============================================================================
-        // FIX END
-        // =============================================================================
     } else {
         $logger->log(sprintf("HEURISTIC_SKIP: Token count (%d) is not above threshold (%d). Proceeding to FSM.", $tokenCount, $minTokensForHeuristic));
     }
@@ -205,7 +141,10 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
     $logger->log("FSM_S");
     
     $addressBlock = preg_replace(['/\s+/', '/([,.])\1+/'], [' ', '$1'], $addressBlock);
-    $preparedBlock = str_replace(',', ' , ', $addressBlock);
+    // =============================================================================
+    // ИЗМЕНЕНИЕ: Добавляем точку с запятой в список символов для токенизации
+    // =============================================================================
+    $preparedBlock = str_replace([',', ';'], [' , ', ' ; '], $addressBlock);
     $preparedBlock = preg_replace('~(\S\.)([^\s.])~u', '$1 $2', $preparedBlock);
     $preparedBlock = trim(preg_replace('/\s+/', ' ', $preparedBlock));
     $tokens = explode(' ', $preparedBlock);
@@ -225,7 +164,7 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
 
     if ($firstMarkerIndex != -1) {
         $startIndex = $firstMarkerIndex;
-        while ($startIndex > 0 && $tokens[$startIndex - 1] !== ',') {
+        while ($startIndex > 0 && !in_array($tokens[$startIndex - 1], [',', ';'])) { // ИЗМЕНЕНИЕ: Учитываем ';' при поиске префикса
             $startIndex--;
         }
         if ($startIndex > 0) {
@@ -252,7 +191,7 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
     $previousCleanToken = '';
 
     if (!empty($prefix)) {
-        $prefixTokens = explode(' ', str_replace(',', ' , ', $prefix));
+        $prefixTokens = explode(' ', str_replace([',', ';'], [' , ', ' ; '], $prefix)); // ИЗМЕНЕНИЕ: Учитываем ';'
         $lastCommaPos = array_search(',', array_reverse($prefixTokens, true));
         
         $potentialContext = ($lastCommaPos !== false) ? array_slice($prefixTokens, $lastCommaPos + 1) : $prefixTokens;
@@ -272,6 +211,27 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
     }
 
     foreach ($tokens as $token) {
+        // =============================================================================
+        // ИЗМЕНЕНИЕ: Добавлен блок обработки точки с запятой как разделителя адресов
+        // =============================================================================
+        if (trim($token) === ';') {
+            $logger->log("';' | Semicolon found. Finalizing address.");
+            if (!empty(array_filter($currentAddressParts, 'trim'))) {
+                $builtAddress = buildAddress($prefix, $currentAddressParts);
+                $finalAddresses[] = $builtAddress;
+                $logger->log("FINALIZED_BY_SEMICOLON: \"" . $builtAddress . "\"");
+
+                // Сброс для следующей части, сохраняя контекст населенного пункта
+                $currentAddressParts = $localityContextIsValid ? $localityContextParts : [];
+                $hasSeenLocality = $localityContextIsValid;
+                $hasSeenStreet = false;
+                $hasSeenHousePart = false;
+                $addressPartCompleted = false;
+                $partJustFinished = false;
+            }
+            continue; // Переходим к следующему токену
+        }
+
         $cleanTokenWithColon = mb_strtolower($token, 'UTF-8');
         $cleanToken = mb_strtolower(rtrim($token, '.'), 'UTF-8');
 
@@ -374,7 +334,7 @@ function splitAddresses(string $addressBlock, AiLogger $logger): array
             $markerIndex = count($currentAddressParts) - 1;
             $nameStartIndex = $markerIndex;
 
-            while ($nameStartIndex > 0 && $currentAddressParts[$nameStartIndex - 1] !== ',') {
+            while ($nameStartIndex > 0 && !in_array($currentAddressParts[$nameStartIndex - 1], [',', ';'])) { // ИЗМЕНЕНИЕ: Учитываем ';'
                 $nameStartIndex--;
             }
 

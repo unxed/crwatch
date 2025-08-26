@@ -544,8 +544,28 @@ function splitAddresses(string $addressBlock): array
                     break;
                 }
             }
+
+        // Old code. Caused hangs (see "hang 1" test case)
+        /*
+        } else if ($currentLevel === LEVEL_HOUSE) {
+            $streetMarkersForSplit = [' ул.', ' ул ', ' пр-т', ' пр ', ' б-р', ' пер '];
+             foreach ($streetMarkersForSplit as $streetMarker) {
+                $streetPos = mb_stripos($currentAddressParts[LEVEL_HOUSE], $streetMarker);
+                if ($streetPos !== false) {
+                    $housePart = trim(mb_substr($currentAddressParts[LEVEL_HOUSE], 0, $streetPos));
+                    $streetPart = trim(mb_substr($currentAddressParts[LEVEL_HOUSE], $streetPos));
+                    log_ai("Post-split: Found street marker '{$streetMarker}' in house component. Splitting.");
+                    $currentAddressParts[LEVEL_HOUSE] = $housePart;
+                    array_unshift($processingQueue, $streetPart);
+                    log_ai("New house part: '{$housePart}'. Re-queuing street part: '{$streetPart}'.");
+                    $lastLevel = LEVEL_HOUSE;
+                    break;
+                }
+            }
+        */
         }
 
+        // New code to avoid hangs, begin
         if ($currentLevel === LEVEL_STREET) {
             $houseMarkersForSplit = [' д.', ' дом '];
             foreach ($houseMarkersForSplit as $houseMarker) {
@@ -553,7 +573,7 @@ function splitAddresses(string $addressBlock): array
                 if ($housePos !== false) {
                     $streetPart = trim(mb_substr($currentAddressParts[LEVEL_STREET], 0, $housePos));
                     $housePart = trim(mb_substr($currentAddressParts[LEVEL_STREET], $housePos));
-                    
+
                     log_ai("Post-split: Found house marker '{$houseMarker}' in street component. Splitting.");
                     $currentAddressParts[LEVEL_STREET] = $streetPart;
                     array_unshift($processingQueue, $housePart);
@@ -562,6 +582,7 @@ function splitAddresses(string $addressBlock): array
                 }
             }
         }
+        // New code to avoid hangs, end
 
         // Входим в режим "внутри скобок".
         if (mb_strpos($cleanComponent, '(') !== false && mb_strpos($cleanComponent, ')') === false) {

@@ -26,9 +26,9 @@ function truncateForTelegram(string $text, int $maxLength = 1000): string {
 }
 
 /**
- * Улучшенная функция "нормализации" поискового запроса пользователя.
+ * Функция "нормализации" теперь обрабатывает только строку с адресом.
  */
-function normalizeSearchQuery(string $text): array
+function normalizeSearchQuery(string $addressText): array
 {
     $stopWords = [
         'улица', 'ул', 'область', 'обл', 'район', 'р-н', 'рн', 'город', 'гор', 'г',
@@ -36,7 +36,7 @@ function normalizeSearchQuery(string $text): array
         'проспект', 'пр-т', 'пр', 'бульвар', 'б-р', 'республика', 'респ'
     ];
 
-    $text = preg_replace('/[.,\/#!$%\^&\*;:{}=\-`~()]/', ' ', mb_strtolower($text));
+    $text = preg_replace('/[.,\/#!$%\^&\*;:{}=\-`~()]/', ' ', mb_strtolower($addressText));
     $words = preg_split('/\s+/', $text, -1, PREG_SPLIT_NO_EMPTY);
 
     return array_diff($words, $stopWords);
@@ -86,18 +86,34 @@ while (true) {
             if (empty($text)) continue;
 
             if ($text === '/start') {
-                $startMessage = "Здравствуйте\! 👋\n\nЯ бот для поиска закупок по адресу\. Просто отправьте мне адрес или его часть, например:";
-                $exampleBlock = "```\nБурятия Саган-Нур Больничная 12\n```";
-                $telegram->sendMessage(['chat_id' => $chatId, 'text' => $startMessage . "\n" . $exampleBlock, 'parse_mode' => 'MarkdownV2']);
+                // ИЗМЕНЕНИЕ: Приветствие теперь упоминает капремонт
+                $startMessage = "Здравствуйте\! 👋\n\nЯ бот для поиска закупок по *капитальному ремонту* по адресу\.";
+                $mainInfo = "Просто отправьте мне адрес или его часть\. На первой строке — адрес, на второй \(необязательно\) — минимальная начальная цена закупки\.";
+                $exampleTitle1 = "Пример поиска только по адресу:";
+                $exampleBlock1 = "```\nБурятия Саган-Нур Больничная 12\n```";
+                $exampleTitle2 = "Пример поиска с фильтром по цене \(от 500 тыс\. руб\.\):";
+                $exampleBlock2 = "```\nОрловская\n500000000\n```";
+
+                $fullMessage = implode("\n\n", [$startMessage, $mainInfo, $exampleTitle1, $exampleBlock1, $exampleTitle2, $exampleBlock2]);
+                $telegram->sendMessage(['chat_id' => $chatId, 'text' => $fullMessage, 'parse_mode' => 'MarkdownV2']);
                 continue;
             }
 
             logMessage("Получен поисковый запрос от chat_id $chatId: '$text'");
 
-            $keywords = normalizeSearchQuery($text);
+            $lines = explode("\n", trim($text));
+            $addressQuery = $lines[0] ?? '';
+            $priceQuery = $lines[1] ?? null;
+
+            $minPrice = 0.0;
+            if ($priceQuery !== null && is_numeric(trim($priceQuery))) {
+                $minPrice = (float)trim($priceQuery);
+            }
+
+            $keywords = normalizeSearchQuery($addressQuery);
 
             if (empty($keywords)) {
-                $telegram->sendMessage(['chat_id' => $chatId, 'text' => "Пожалуйста, введите более конкретный адрес для поиска."]);
+                $telegram->sendMessage(['chat_id' => $chatId, 'text' => "Пожалуйста, введите адрес для поиска на первой строке."]);
                 continue;
             }
 
@@ -116,7 +132,7 @@ while (true) {
             $sql = "
                 SELECT 
                     p.reg_number, pl.address AS work_location, p.procurement_object,
-                    c.name AS customer_name, contr.price, contr.conclusion_date
+                    c.name AS customer_name, p.initial_price, contr.conclusion_date
                 FROM procurement_locations AS pl
                 JOIN procurements AS p ON pl.procurement_id = p.id
                 LEFT JOIN customers AS c ON p.customer_id = c.id
@@ -134,7 +150,12 @@ while (true) {
                 $sql .= " AND (" . implode(' AND ', $rlike_conditions) . ")";
             }
 
-            $sql .= " LIMIT 10";
+            if ($minPrice > 0) {
+                $sql .= " AND p.initial_price >= :min_price";
+                $params[':min_price'] = $minPrice;
+            }
+
+            $sql .= " ORDER BY p.initial_price DESC LIMIT 10";
 
             logMessage("Сформирован SQL: " . preg_replace('/\s+/', ' ', $sql));
             logMessage("Параметры: " . json_encode($params));
@@ -147,15 +168,23 @@ while (true) {
                 $telegram->sendMessage(['chat_id' => $chatId, 'text' => "😔 К сожалению, по вашему запросу ничего не найдено."]);
             } else {
                 $count = count($results);
+
+                // ИЗМЕНЕНИЕ: Убрано упоминание капремонта из ответного сообщения
+                $foundMessage = "✅ Найдено закупок: *" . $count . "*";
+                if ($minPrice > 0) {
+                    $priceFormatted = number_format($minPrice, 0, ',', ' ');
+                    $foundMessage .= " с начальной ценой от *" . escapeMarkdownV2($priceFormatted . ' ₽') . "*";
+                }
+
                 $telegram->sendMessage([
                     'chat_id' => $chatId,
-                    'text' => "✅ Найдено закупок: *" . $count . "*",
+                    'text' => $foundMessage,
                     'parse_mode' => 'MarkdownV2'
                 ]);
 
                 foreach ($results as $index => $row) {
-                    $priceFormatted = $row['price'] ? number_format($row['price'], 2, ',', ' ') . ' ₽' : 'Нет данных';
-                    
+                    $priceFormatted = $row['initial_price'] ? number_format($row['initial_price'], 2, ',', ' ') . ' ₽' : 'Нет данных';
+
                     $objectText = truncateForTelegram($row['procurement_object'] ?? 'Нет данных', 500);
                     $locationText = truncateForTelegram($row['work_location'] ?? 'Нет данных', 250);
                     $detailsUrl = "https://zakupki.gov.ru/epz/order/notice/ea615/view/common-info.html?regNumber=" . $row['reg_number'];
@@ -165,7 +194,7 @@ while (true) {
                         "",
                         "*Объект:* " . escapeMarkdownV2($objectText),
                         "*Адрес:* " . escapeMarkdownV2($locationText),
-                        "*Цена контракта:* " . escapeMarkdownV2($priceFormatted),
+                        "*Начальная цена:* " . escapeMarkdownV2($priceFormatted),
                         "*Дата заключения:* " . escapeMarkdownV2($row['conclusion_date'] ?? 'Нет данных'),
                         "*Заказчик:* " . escapeMarkdownV2($row['customer_name'] ?? 'Нет данных'),
                         "[Подробнее на сайте](" . $detailsUrl . ")"

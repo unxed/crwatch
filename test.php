@@ -61,9 +61,15 @@
  * - Проблема: Обнаружен бесконечный цикл из-за слишком агрессивной пост-обработки "склеенных" чанков.
  * - Решение: Пост-обработка была упрощена и оставлена только для самого частого случая ("дом внутри улицы"),
  *   чтобы предотвратить зацикливание на редких форматах.
+ *
+ * Версия 46: Динамический лимит и проверка полноты адреса
+ * - Проблема: Адреса без города (напр. "Российская Федерация, д. 2") считались валидными, что приводило к ошибкам.
+ * - Решение: Добавлена проверка на наличие `LEVEL_CITY` в структуре `currentAddressParts` *перед* финализацией адреса.
+ *   Если компонент города отсутствует, весь разбор считается неудачным.
+ * - Улучшение: Жесткий лимит итераций заменен на динамический, зависящий от количества "чанков" во входной строке.
  */
 
-define("MAX_ITERATIONS", 1000); // Максимально допустимое количество итераций разбора адреса
+define("ITERATION_MULTIPLIER", 2); // Множитель для расчета лимита. Будут ложные бесконечные циклы — увеличить.
 
 ini_set('display_errors', 1);
 error_reporting(E_ALL);
@@ -327,18 +333,15 @@ function splitAddresses(string $addressBlock): array
     $markerlessKeywords = ['Санкт-Петербург' => LEVEL_CITY, 'Москва' => LEVEL_CITY, 'Севастополь' => LEVEL_CITY];
     
     // --- Переменные состояния парсера ---
-    $results = [];             // Массив с готовыми, разобранными адресами.
-    $currentAddressParts = []; // Ассоциативный массив [уровень => компонент] для текущего собираемого адреса.
-    $lastLevel = -1;           // Уровень иерархии последнего обработанного компонента.
-    $foundAtLeastOneHouse = false; // Флаг, был ли найден хотя бы один дом во всем блоке.
-    $lastHouseComponent = null;  // Хранит текст последнего компонента дома для "висячих" литер.
-    $inParenthesesMode = false;  // Флаг, находимся ли мы внутри (...) для сбора всего содержимого.
+    $results = [];
+    $currentAddressParts = [];
+    $lastLevel = -1;
+    $foundAtLeastOneHouse = false;
+    $lastHouseComponent = null;
+    $inParenthesesMode = false;
+    $foundIncompleteAddress = false; // Флаг, что мы нашли адрес без города
 
-    $iterations = 0;             // Счетчик итераций для предотвращения бесконечных циклов.
-    $infiniteLoopDetected = false; // Флаг, который установится в true при обнаружении цикла.    
-    
     // --- 1. Начальное формирование очереди обработки ---
-    // Разбиваем весь входной блок на "чанки" по разделителям.
     $cursor = 0;
     $length = mb_strlen($addressBlock);
     $delimiters = [',', ';', "\n"];
@@ -355,12 +358,16 @@ function splitAddresses(string $addressBlock): array
         $cursor = $nextPos + 1; 
     }
 
+    $maxIterations = count($processingQueue) * ITERATION_MULTIPLIER + 100; // Множитель + база на всякий случай
+    $iterations = 0;
+    $infiniteLoopDetected = false;
+    
     // --- 2. Основной цикл обработки очереди ---
     while (!empty($processingQueue)) {
 
         $iterations++;
-        if ($iterations > MAX_ITERATIONS) {
-            log_ai("!!! ОШИБКА: Обнаружен бесконечный цикл после " . MAX_ITERATIONS . " итераций. Прерывание.");
+        if ($iterations > $maxIterations) {
+            log_ai("!!! ОШИБКА: Обнаружен бесконечный цикл после " . $maxIterations . " итераций. Прерывание.");
             $infiniteLoopDetected = true;
             break; // Выходим из цикла while
         }
@@ -499,6 +506,11 @@ function splitAddresses(string $addressBlock): array
             // Финализируем предыдущий адрес, если он не был только что сохранен.
             $builtAddress = '';
             if (!empty($currentAddressParts) && (isset($currentAddressParts[LEVEL_STREET]) || isset($currentAddressParts[LEVEL_HOUSE]))) {
+                 // ПРОВЕРКА: есть ли в адресе населенный пункт?
+                 if (!isset($currentAddressParts[LEVEL_CITY])) {
+                     log_ai(">>>> INVALID ADDRESS DETECTED (missing city): " . implode(', ', $currentAddressParts));
+                     $foundIncompleteAddress = true; // Ставим флаг
+                 }
                  ksort($currentAddressParts);
                  $builtAddress = implode(', ', $currentAddressParts);
             }
@@ -584,6 +596,11 @@ function splitAddresses(string $addressBlock): array
     // --- 7. Финализация ---
     // Сохраняем последний адрес, оставшийся в сборке.
     if (!empty($currentAddressParts) && (isset($currentAddressParts[LEVEL_STREET]) || isset($currentAddressParts[LEVEL_HOUSE]))) {
+        // ПРОВЕРКА: есть ли в последнем адресе населенный пункт?
+        if (!isset($currentAddressParts[LEVEL_CITY])) {
+            log_ai(">>>> FINAL INVALID ADDRESS DETECTED (missing city): " . implode(', ', $currentAddressParts));
+            $foundIncompleteAddress = true; // Ставим флаг
+        }
         ksort($currentAddressParts);
         $results[] = implode(', ', $currentAddressParts);
         log_ai(">>>> FINAL ADDRESS BUILT: " . end($results));
@@ -608,6 +625,13 @@ function splitAddresses(string $addressBlock): array
 
     // --- 8. Финальная проверка и возврат результата ---
 
+    // Проверяем, был ли найден адрес без города
+    if ($foundIncompleteAddress) {
+        $GLOBALS['parse_reason'] = "Обнаружен неполный адрес без компонента населенного пункта";
+        log_ai("Incomplete address found during parsing. Rolling back all results.");
+        return [$addressBlock];
+    }
+    
     // Сначала проверяем на ошибку парсинга (бесконечный цикл)
     if ($infiniteLoopDetected) {
         $GLOBALS['parse_reason'] = "Обнаружен бесконечный цикл";

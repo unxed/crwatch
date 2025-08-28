@@ -61,9 +61,20 @@
  * - Проблема: Обнаружен бесконечный цикл из-за слишком агрессивной пост-обработки "склеенных" чанков.
  * - Решение: Пост-обработка была упрощена и оставлена только для самого частого случая ("дом внутри улицы"),
  *   чтобы предотвратить зацикливание на редких форматах.
+ *
+ * Версия 58 (финальная, с "умным сбросом"):
+ * - Противоречие: Парсер не мог понять, когда новая улица относится к предыдущему "под-городу" (как в Колпино),
+ *   а когда означает выход из "под-города" и возврат к основному (как в Стрельне).
+ * - Решение: Внедрена новая механика "основной город/подгород".
+ *   1.  Города федерального значения (Санкт-Петербург, Москва) повышены до уровня РЕГИОНА.
+ *   2.  Компоненты типа "г. Колпино" или "пос. Стрельна" внутри них считаются "под-городами" (LEVEL_CITY).
+ *   3.  Ключевое правило: когда адрес с "под-городом" завершается и начинается новый адрес с улицы,
+ *       парсер принудительно сбрасывает контекст "под-города" (LEVEL_CITY), возвращаясь к основному городу-региону.
+ *   Это позволяет правильно обрабатывать вложенные структуры адресов, решая конфликтующие кейсы `short 1` и `СПб 2`.
  */
 
 define("MAX_ITERATIONS", 4000); // Максимально допустимое количество итераций разбора адреса
+define("JUNK_CHUNK_LENGTH_THRESHOLD", 70); // Порог длины чанка, после которого он может считаться "мусором"
 
 ini_set('display_errors', 1);
 error_reporting(E_ALL);
@@ -225,7 +236,7 @@ function findMarkerInChunk(string $chunk, array $markers, array $ambiguousMarker
                     $isAfterOk = true; // После маркера пробел, пунктуация или цифра
                 }
             }
-            
+
             // Маркер должен быть отдельным словом
             if (in_array($before, [' ', '(']) && $isAfterOk) {
                 // Контекстная проверка для маркера "г" (город или литера Г)
@@ -239,16 +250,27 @@ function findMarkerInChunk(string $chunk, array $markers, array $ambiguousMarker
                     }
                 }
 
+                // Контекстная проверка для "п." (поселок или пункт)
+                if ($marker === 'п.' || $marker === 'п') {
+                    $contentAfter = trim(mb_substr($chunk, $pos + $markerLen));
+                    if (!empty($contentAfter) && is_numeric(mb_substr($contentAfter, 0, 1))) {
+                        log_ai("Contextual 'п.': Marker is followed by a digit. Assuming 'пункт', not 'поселок'. Ignoring.");
+                        continue;
+                    }
+                }
+
                 $currentLevel = $level;
                 // Контекстная проверка для "д." (дом или деревня)
                 if ($marker === 'д.') {
-                    $hasStreetLevel = isset($currentAddressParts[LEVEL_STREET]);
+                    // Считаем домом, если есть улица ИЛИ город, И в остатке есть цифры
+                    $hasLocationContext = isset($currentAddressParts[LEVEL_STREET]) || isset($currentAddressParts[LEVEL_CITY]);
                     $chunkWithoutMarker = trim(str_ireplace('д.', '', $chunk));
-                    // Считаем домом, только если уже есть улица И в остатке есть цифры
-                    if ($hasStreetLevel && containsDigits($chunkWithoutMarker)) {
+                    if ($hasLocationContext && containsDigits($chunkWithoutMarker)) {
                          $currentLevel = LEVEL_HOUSE;
+                         log_ai("Contextual 'д.': Recognized as HOUSE because location context exists and chunk has digits.");
                     } else {
                          $currentLevel = LEVEL_CITY;
+                         log_ai("Contextual 'д.': Recognized as CITY because no street/city context or no digits in chunk.");
                     }
                 }
                 return ['marker' => $marker, 'level' => $currentLevel, 'pos' => $pos];
@@ -305,6 +327,47 @@ function isHouseComponent(string $component): bool
 }
 
 /**
+ * Более строгая проверка, является ли чанк компонентом дома.
+ * Используется в lookahead, чтобы избежать ложных срабатываний.
+ * @param string $component Фрагмент для проверки.
+ * @param array $markers Список маркеров.
+ * @return bool True, если в чанке есть явный маркер дома ('д.', 'корп.' и т.д.).
+ */
+function isClearlyHouseComponent(string $component, array $markers): bool
+{
+    foreach ($markers as $marker => $level) {
+        if ($level === LEVEL_HOUSE) {
+            // Используем mb_stripos для простой проверки наличия
+            if (mb_stripos($component, $marker) !== false) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * Проверяет, является ли входная строка "мусором" (описательным текстом).
+ * @param array $chunks Массив чанков для анализа.
+ * @param array $markers Список маркеров.
+ * @param array $ambiguousMarkers Устарело.
+ * @return bool True, если строка похожа на "мусор".
+ */
+function isJunkInput(array $chunks, array $markers, array $ambiguousMarkers): bool
+{
+    foreach ($chunks as $chunk) {
+        if (mb_strlen($chunk) > JUNK_CHUNK_LENGTH_THRESHOLD) {
+            // Используем надежную проверку, чтобы не найти маркер внутри слова
+            if (findMarkerInChunk($chunk, $markers, $ambiguousMarkers, []) === null) {
+                log_ai("Junk detected: Chunk '{$chunk}' is long and has no valid address markers.");
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
  * Основная функция для разделения блока адресов на отдельные адреса.
  */
 function splitAddresses(string $addressBlock): array
@@ -317,14 +380,16 @@ function splitAddresses(string $addressBlock): array
         'обл' => LEVEL_REGION, 'область' => LEVEL_REGION, 'край' => LEVEL_REGION, 'Респ' => LEVEL_REGION, 'республика' => LEVEL_REGION, 'АО' => LEVEL_REGION,
         'р-н' => LEVEL_DISTRICT, 'район' => LEVEL_DISTRICT, 'ГО:' => LEVEL_DISTRICT, 'МР:' => LEVEL_DISTRICT, 'округ' => LEVEL_DISTRICT,
         'г.' => LEVEL_CITY, 'г' => LEVEL_CITY, 'город' => LEVEL_CITY, 'с.' => LEVEL_CITY, 'село' => LEVEL_CITY, 'п.' => LEVEL_CITY, 'п' => LEVEL_CITY, 'пос.' => LEVEL_CITY, 'поселок' => LEVEL_CITY, 'рп.' => LEVEL_CITY, 'рп' => LEVEL_CITY, 'р. п.' => LEVEL_CITY, 'р.п.' => LEVEL_CITY, 'д.' => LEVEL_CITY,
-        'квл' => LEVEL_STREET, 'наб.кан.' => LEVEL_STREET, 'кан.' => LEVEL_STREET, 'ул.' => LEVEL_STREET, 'ул' => LEVEL_STREET, 'улица' => LEVEL_STREET, 'пр-т' => LEVEL_STREET, 'пр.' => LEVEL_STREET, 'пр-кт' => LEVEL_STREET, 'проспект' => LEVEL_STREET, 'б-р' => LEVEL_STREET, 'б-р.' => LEVEL_STREET, 'бульвар' => LEVEL_STREET, 'пер.' => LEVEL_STREET, 'переулок' => LEVEL_STREET, 'наб.' => LEVEL_STREET, 'набережная' => LEVEL_STREET, 'ш.' => LEVEL_STREET, 'шоссе' => LEVEL_STREET, 'проезд' => LEVEL_STREET, 'линия' => LEVEL_STREET, 'дорога' => LEVEL_STREET, 'мкр.' => LEVEL_STREET, 'мкр' => LEVEL_STREET, 'мкрн.' => LEVEL_STREET, 'мкрн' => LEVEL_STREET, 'микрорайон' => LEVEL_STREET,
+        'квл' => LEVEL_STREET, 'наб.кан.' => LEVEL_STREET, 'кан.' => LEVEL_STREET, 'ул.' => LEVEL_STREET, 'ул' => LEVEL_STREET, 'улица' => LEVEL_STREET, 'пр-т' => LEVEL_STREET, 'пр.' => LEVEL_STREET, 'просп' => LEVEL_STREET, 'просп.' => LEVEL_STREET, 'пр-кт' => LEVEL_STREET, 'проспект' => LEVEL_STREET, 'бул' => LEVEL_STREET, 'бул.' => LEVEL_STREET, 'б-р' => LEVEL_STREET, 'б-р.' => LEVEL_STREET, 'бульвар' => LEVEL_STREET, 'пер.' => LEVEL_STREET, 'переулок' => LEVEL_STREET, 'наб.' => LEVEL_STREET, 'набережная' => LEVEL_STREET, 'ш.' => LEVEL_STREET, 'шоссе' => LEVEL_STREET, 'пр-д' => LEVEL_STREET, 'проезд' => LEVEL_STREET, 'линия' => LEVEL_STREET, 'дорога' => LEVEL_STREET, 'мкр.' => LEVEL_STREET, 'мкр' => LEVEL_STREET, 'мкрн.' => LEVEL_STREET, 'мкрн' => LEVEL_STREET, 'микрорайон' => LEVEL_STREET,
         'д.' => LEVEL_HOUSE, 'дом' => LEVEL_HOUSE, 'корп.' => LEVEL_HOUSE, 'корп' => LEVEL_HOUSE, 'к.' => LEVEL_HOUSE, 'корпус' => LEVEL_HOUSE, 'стр.' => LEVEL_HOUSE, 'строение' => LEVEL_HOUSE, 'литера' => LEVEL_HOUSE, 'лит.' => LEVEL_HOUSE,
     ];
     uksort($markersConfig, function ($a, $b) { return mb_strlen($b) - mb_strlen($a); });
     $markers = $markersConfig;
-    $ambiguousMarkers = []; // Устарело, логика перенесена в findMarkerInChunk
+    $ambiguousMarkers = [];
+
     // Города федерального значения, которые могут быть без маркера "г.".
-    $markerlessKeywords = ['Санкт-Петербург' => LEVEL_CITY, 'Москва' => LEVEL_CITY, 'Севастополь' => LEVEL_CITY];
+    // Повышены до уровня РЕГИОНА, чтобы могли содержать "под-города".
+    $markerlessKeywords = ['Санкт-Петербург' => LEVEL_REGION, 'Москва' => LEVEL_REGION, 'Севастополь' => LEVEL_REGION];
     
     // --- Переменные состояния парсера ---
     $results = [];             // Массив с готовыми, разобранными адресами.
@@ -333,10 +398,9 @@ function splitAddresses(string $addressBlock): array
     $foundAtLeastOneHouse = false; // Флаг, был ли найден хотя бы один дом во всем блоке.
     $lastHouseComponent = null;  // Хранит текст последнего компонента дома для "висячих" литер.
     $inParenthesesMode = false;  // Флаг, находимся ли мы внутри (...) для сбора всего содержимого.
-
     $iterations = 0;             // Счетчик итераций для предотвращения бесконечных циклов.
-    $infiniteLoopDetected = false; // Флаг, который установится в true при обнаружении цикла.    
-    
+    $infiniteLoopDetected = false; // Флаг, который установится в true при обнаружении цикла.
+
     // --- 1. Начальное формирование очереди обработки ---
     // Разбиваем весь входной блок на "чанки" по разделителям.
     $cursor = 0;
@@ -355,14 +419,19 @@ function splitAddresses(string $addressBlock): array
         $cursor = $nextPos + 1; 
     }
 
+    // --- Предварительная проверка на "мусор" ---
+    if (isJunkInput($processingQueue, $markers, $ambiguousMarkers)) {
+        $GLOBALS['parse_reason'] = "Обнаружены неадресные данные";
+        return [$addressBlock];
+    }
+
     // --- 2. Основной цикл обработки очереди ---
     while (!empty($processingQueue)) {
-
         $iterations++;
         if ($iterations > MAX_ITERATIONS) {
             log_ai("!!! ОШИБКА: Обнаружен бесконечный цикл после " . MAX_ITERATIONS . " итераций. Прерывание.");
             $infiniteLoopDetected = true;
-            break; // Выходим из цикла while
+            break;
         }
 
         $chunk = array_shift($processingQueue);
@@ -380,7 +449,7 @@ function splitAddresses(string $addressBlock): array
                 $inParenthesesMode = false;
                 if($lastKey === LEVEL_HOUSE) $lastHouseComponent = $currentAddressParts[$lastKey];
             }
-            continue; // Пропускаем всю остальную логику.
+            continue;
         }
 
         // --- Предварительная обработка и разделение чанка ---
@@ -393,12 +462,12 @@ function splitAddresses(string $addressBlock): array
             if ($part1 !== '') array_unshift($processingQueue, $part1);
             continue;
         }
-        
+
         if (($colonPos = mb_strpos($chunk, ':')) !== false) {
             $chunk = trim(mb_substr($chunk, $colonPos + 1));
             if (empty($chunk)) continue;
         }
-        
+
         log_ai("--- PROCESSING CHUNK: '{$chunk}' ---");
         $cleanComponent = removeLeadingNoise($chunk);
 
@@ -418,7 +487,7 @@ function splitAddresses(string $addressBlock): array
                  log_ai("Split blocked: marker level >= STREET, or part before marker is not a house component.");
             }
         }
-        
+
         // --- 3. Определение уровня и типа компонента ---
         $currentLevel = null;
         foreach ($markerlessKeywords as $keyword => $level) {
@@ -432,7 +501,6 @@ function splitAddresses(string $addressBlock): array
             if ($markerInfo) {
                 $currentLevel = $markerInfo['level'];
             } else {
-                // Логика "взгляда вперед" (Lookahead).
                 $combined = false;
                 if (!empty($processingQueue)) {
                     $nextChunk = $processingQueue[0];
@@ -446,7 +514,6 @@ function splitAddresses(string $addressBlock): array
                                 $shouldCombine = true;
                                 log_ai("LOOKAHEAD OVERRIDE: Combining single word '{$cleanComponent}' with next marker despite level drop.");
                             }
-
                             if ($shouldCombine) {
                                 $cleanComponent = $cleanComponent . ' ' . array_shift($processingQueue);
                                 $currentLevel = $level;
@@ -456,10 +523,22 @@ function splitAddresses(string $addressBlock): array
                         }
                     }
                 }
+
                 if (!$combined) {
-                    if ($lastLevel === LEVEL_HOUSE && mb_strlen($cleanComponent) <= 2) {
+                    // Исправлен порядок проверок для правильной обработки территорий
+                    if (isset($currentAddressParts[LEVEL_CITY]) && $lastLevel >= LEVEL_CITY && !isHouseComponent($cleanComponent)) {
+                        $currentAddressParts[LEVEL_CITY] .= ', ' . $cleanComponent;
+                        log_ai("Appending unmarked sub-locality '{$cleanComponent}' to existing city component.");
+                        continue;
+                    }
+                    else if (!empty($processingQueue) && isClearlyHouseComponent($processingQueue[0], $markers) && !containsDigits($cleanComponent)) {
+                        log_ai("Lookahead for hanging street: Chunk '{$cleanComponent}' is followed by clear house component '{$processingQueue[0]}'. Assuming current is a street.");
+                        $currentLevel = LEVEL_STREET;
+                    }
+                    else if ($lastLevel === LEVEL_HOUSE && mb_strlen($cleanComponent) <= 2) {
                         $currentLevel = LEVEL_HOUSE;
-                    } else if (isHouseComponent($cleanComponent)) {
+                    }
+                    else if (isHouseComponent($cleanComponent)) {
                         $currentLevel = LEVEL_HOUSE;
                     } else {
                         log_ai("No marker/digits/keywords. Skipping as noise: '{$cleanComponent}'");
@@ -468,14 +547,13 @@ function splitAddresses(string $addressBlock): array
                 }
             }
         }
-        
+
         if ($currentLevel === LEVEL_HOUSE) $foundAtLeastOneHouse = true;
 
         // --- 4. Принятие решения: новый адрес или часть текущего? ---
         $isNewAddress = ($lastLevel !== -1 && $currentLevel <= $lastLevel);
         $newHousePartFromHanging = null; 
 
-        // Особая логика для "висячих" домов и литер.
         if ($isNewAddress && $currentLevel == LEVEL_HOUSE && $lastLevel == LEVEL_HOUSE) {
             $isSupplementToHouse = true;
             $markerInfo = findMarkerInChunk($cleanComponent, $markers, $ambiguousMarkers, $currentAddressParts);
@@ -493,7 +571,7 @@ function splitAddresses(string $addressBlock): array
                 }
             }
         }
-        
+
         // --- 5. Сборка адреса ---
         if ($isNewAddress) {
             // Финализируем предыдущий адрес, если он не был только что сохранен.
@@ -507,22 +585,32 @@ function splitAddresses(string $addressBlock): array
                  log_ai(">>>> ADDRESS BUILT: " . end($results));
             }
 
-            // Сохраняем контекст для нового адреса.
+            // "Умный сброс" контекста для городов федерального значения.
             $newParts = [];
-            if ($currentLevel == LEVEL_HOUSE && $lastLevel == LEVEL_HOUSE) {
-                // Для висячего дома сохраняем все до дома.
-                foreach ($currentAddressParts as $lvl => $part) {
-                    if ($lvl < LEVEL_HOUSE) $newParts[$lvl] = $part;
+            $cutOffLevel = $currentLevel;
+
+            if ($currentLevel == LEVEL_STREET
+                && isset($currentAddressParts[LEVEL_REGION])
+                && isset($currentAddressParts[LEVEL_CITY]))
+            {
+                $regionComponent = $currentAddressParts[LEVEL_REGION];
+                // Проверяем, является ли регион городом федерального значения
+                if (array_key_exists($regionComponent, $markerlessKeywords)) {
+                    $cutOffLevel = LEVEL_DISTRICT; // ...то сбрасываем "под-город", оставляя только основной город-регион.
+                    log_ai("New street under a federal city region. Resetting sub-city context.");
                 }
-            } else {
-                // Для нового города/улицы сохраняем все, что выше по иерархии.
-                foreach ($currentAddressParts as $lvl => $part) {
-                    if ($lvl < $currentLevel) $newParts[$lvl] = $part;
+            } else if ($currentLevel == LEVEL_HOUSE && $lastLevel == LEVEL_HOUSE) {
+                 $cutOffLevel = LEVEL_HOUSE; // Для висячего дома сохраняем все, что < LEVEL_HOUSE
+            }
+
+            foreach ($currentAddressParts as $lvl => $part) {
+                if ($lvl < $cutOffLevel) {
+                    $newParts[$lvl] = $part;
                 }
             }
             $currentAddressParts = $newParts;
         }
-        
+
         // Добавляем текущий компонент в собираемый адрес.
         if ($newHousePartFromHanging !== null) {
             $currentAddressParts[LEVEL_HOUSE] = $newHousePartFromHanging;
@@ -539,7 +627,7 @@ function splitAddresses(string $addressBlock): array
                 $lastHouseComponent = $cleanComponent;
             }
         }
-        
+
         $lastLevel = $currentLevel;
         ksort($currentAddressParts);
         log_ai("Current address parts: " . implode(' | ', $currentAddressParts));
@@ -580,7 +668,7 @@ function splitAddresses(string $addressBlock): array
             $inParenthesesMode = true;
         }
     }
-    
+
     // --- 7. Финализация ---
     // Сохраняем последний адрес, оставшийся в сборке.
     if (!empty($currentAddressParts) && (isset($currentAddressParts[LEVEL_STREET]) || isset($currentAddressParts[LEVEL_HOUSE]))) {
@@ -588,7 +676,7 @@ function splitAddresses(string $addressBlock): array
         $results[] = implode(', ', $currentAddressParts);
         log_ai(">>>> FINAL ADDRESS BUILT: " . end($results));
     }
-    
+
     // Отфильтровываем "мусорные" строки, которые не являются адресами.
     $finalResults = [];
     foreach ($results as $address) {
@@ -601,7 +689,7 @@ function splitAddresses(string $addressBlock): array
         }
         if (!$isJunk) $finalResults[] = $address;
     }
-    
+
     // Удаляем дубликаты, которые могли возникнуть из-за сложных пере-сборок.
     $finalResults = array_unique($finalResults);
     $finalResults = array_values($finalResults);
@@ -630,7 +718,6 @@ function splitAddresses(string $addressBlock): array
 
     return $finalResults;
 }
-
 
 // --- Основной цикл выполнения ---
 $logAiHandle = fopen('test.ai.log', 'w');
@@ -663,7 +750,7 @@ foreach ($testCases as $caseName => $addressBlock) {
             fwrite($logManHandle, "  " . ($index + 1) . ". {$address}\n");
         }
     }
-    
+
     fwrite($logManHandle, "\n");
 }
 

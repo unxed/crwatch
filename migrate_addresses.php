@@ -1,7 +1,6 @@
 <?php
 
-// define("MAX_ITERATIONS", 1000); // Заменено на динамический лимит
-define("ITERATION_MULTIPLIER", 2); // Новый множитель для расчета лимита
+define("MAX_ITERATIONS", 1000); // Максимально допустимое количество итераций разбора адреса
 
 require_once 'config.php';
 
@@ -31,17 +30,17 @@ function containsDigits(string $str): bool
 function findNumericListMarker(string $chunk): ?int
 {
     $len = mb_strlen($chunk);
-    // Начинаем с 1, так как маркер в самом начале обработает removeLeadingNoise.
     for ($i = 1; $i < $len; $i++) {
-        if (mb_substr($chunk, $i, 1) === ')') {
-            if (is_numeric(mb_substr($chunk, $i - 1, 1))) {
-                // Нашли "цифра)". Теперь найдем начало этой цифровой последовательности.
+        $char = mb_substr($chunk, $i, 1);
+        if ($char === ')') {
+            $prevChar = mb_substr($chunk, $i - 1, 1);
+            if (is_numeric($prevChar)) {
                 $startPos = $i - 1;
                 while ($startPos > 0 && is_numeric(mb_substr($chunk, $startPos - 1, 1))) {
                     $startPos--;
                 }
-                // Убедимся, что перед нумератором стоит пробел.
-                if ($startPos > 0 && mb_substr($chunk, $startPos - 1, 1) === ' ') {
+                $beforeChar = mb_substr($chunk, $startPos - 1, 1);
+                if ($beforeChar === ' ') {
                     return $startPos;
                 }
             }
@@ -54,7 +53,7 @@ function replaceLastWord(string $haystack, string $newWord): string
 {
     $lastSpacePos = mb_strrpos($haystack, ' ');
     if ($lastSpacePos === false) {
-        return $newWord; // Если пробелов нет, вся строка - одно слово.
+        return $newWord;
     }
     $base = mb_substr($haystack, 0, $lastSpacePos);
     return $base . ' ' . $newWord;
@@ -73,7 +72,6 @@ function removeLeadingNoise(string $chunk): string
             $cursor++;
             while ($cursor < $len && mb_substr($chunk, $cursor, 1) === ' ') $cursor++;
             $result = mb_substr($chunk, $cursor);
-            // "Безопасное" удаление. Если удалили всё (например, чанк был "44."), отменяем.
             if ($originalChunk !== '' && $result === '') {
                 return $originalChunk;
             }
@@ -92,36 +90,32 @@ function findMarkerInChunk(string $chunk, array $markers, array $currentAddressP
             $before = ($pos > 0) ? mb_substr($chunk, $pos - 1, 1) : ' ';
             $isAfterOk = false;
             if ($pos + $markerLen >= mb_strlen($chunk)) {
-                $isAfterOk = true; // Маркер в самом конце строки
+                $isAfterOk = true;
             } else {
                 $after = mb_substr($chunk, $pos + $markerLen, 1);
                 if (in_array($after, [' ', '.', ')', '/']) || is_numeric($after)) {
-                    $isAfterOk = true; // После маркера пробел, пунктуация или цифра
+                    $isAfterOk = true;
                 }
             }
-
-            // Маркер должен быть отдельным словом
+            
             if (in_array($before, [' ', '(']) && $isAfterOk) {
-                // Контекстная проверка для маркера "г" (город или литера Г)
                 if ($marker === 'г' || $marker === 'г.') {
                     if ($pos > 0) {
                         $chunkBeforeMarker = trim(mb_substr($chunk, 0, $pos));
                         if (!empty($chunkBeforeMarker) && is_numeric(mb_substr($chunkBeforeMarker, -1))) {
-                            continue; // Это литера, а не город, пропускаем
+                            continue;
                         }
                     }
                 }
 
                 $currentLevel = $level;
-                // Контекстная проверка для "д." (дом или деревня)
                 if ($marker === 'д.') {
                     $hasStreetLevel = isset($currentAddressParts[LEVEL_STREET]);
                     $chunkWithoutMarker = trim(str_ireplace('д.', '', $chunk));
-                    // Считаем домом, только если уже есть улица И в остатке есть цифры
                     if ($hasStreetLevel && containsDigits($chunkWithoutMarker)) {
-                        $currentLevel = LEVEL_HOUSE;
+                         $currentLevel = LEVEL_HOUSE;
                     } else {
-                        $currentLevel = LEVEL_CITY;
+                         $currentLevel = LEVEL_CITY;
                     }
                 }
                 return ['marker' => $marker, 'level' => $currentLevel, 'pos' => $pos];
@@ -145,16 +139,16 @@ function containsHouseKeyword(string $str): bool
 function isHouseComponent(string $component): bool
 {
     $junkHouseKeywords = ['позиция', 'объект', 'многоквартирные'];
-    foreach ($junkHouseKeywords as $keyword) {
+     foreach ($junkHouseKeywords as $keyword) {
         if (mb_stripos($component, $keyword) !== false) {
             return false;
         }
     }
 
     if (containsHouseKeyword($component)) return true;
-
+    
     $hasDigits = containsDigits($component);
-
+    
     // Используем preg_match только для проверки наличия символа, а не для парсинга.
     $hasLetters = preg_match('/\p{L}/u', $component) > 0;
 
@@ -168,14 +162,13 @@ function isHouseComponent(string $component): bool
     return $hasDigits || $hasLetters;
 }
 
-
 /**
  * Разделяет текстовый блок, содержащий один или несколько адресов, на массив отдельных адресов.
  * Функция спроектирована для работы с "грязными" данными без использования регулярных выражений и токенизации.
- *
+ * 
  * @param string $addressBlock Входная строка с одним или несколькими адресами.
  * @return array Массив извлеченных адресов. Если не удалось извлечь более одного адреса с указанием дома,
- *               или был найден неполный адрес, возвращает массив, содержащий исходную строку.
+ *               возвращает массив, содержащий исходную строку.
  */
 function splitAddresses(string $addressBlock): array
 {
@@ -190,16 +183,17 @@ function splitAddresses(string $addressBlock): array
     uksort($markersConfig, function ($a, $b) { return mb_strlen($b) - mb_strlen($a); });
     $markers = $markersConfig;
     $markerlessKeywords = ['Санкт-Петербург' => LEVEL_CITY, 'Москва' => LEVEL_CITY, 'Севастополь' => LEVEL_CITY];
-
-    $results = [];
-    $currentAddressParts = [];
+    
+    $results = []; 
+    $currentAddressParts = []; 
     $lastLevel = -1;
     $foundAtLeastOneHouse = false;
     $lastHouseComponent = null;
     $inParenthesesMode = false;
-    $foundIncompleteAddress = false; // Флаг, что мы нашли адрес без города
 
-    // --- 1. Начальное формирование очереди обработки ---
+    $iterations = 0;               // Счетчик итераций для предотвращения бесконечных циклов.
+    $infiniteLoopDetected = false; // Флаг, который установится в true при обнаружении цикла.    
+    
     $cursor = 0;
     $length = mb_strlen($addressBlock);
     $delimiters = [',', ';', "\n"];
@@ -213,24 +207,19 @@ function splitAddresses(string $addressBlock): array
         }
         $chunk = trim(mb_substr($addressBlock, $cursor, $nextPos - $cursor));
         if ($chunk !== '') $processingQueue[] = $chunk;
-        $cursor = $nextPos + 1;
+        $cursor = $nextPos + 1; 
     }
 
-    $maxIterations = count($processingQueue) * ITERATION_MULTIPLIER + 100; // Множитель + база на всякий случай
-    $iterations = 0;
-    $infiniteLoopDetected = false;
-
-    // --- 2. Основной цикл обработки очереди ---
     while (!empty($processingQueue)) {
 
         $iterations++;
-        if ($iterations > $maxIterations) {
+        if ($iterations > MAX_ITERATIONS) {
             $infiniteLoopDetected = true;
             break; // Выходим из цикла while
-        }
-
+        }        
+        
         $chunk = array_shift($processingQueue);
-
+        
         if ($inParenthesesMode) {
             $lastKey = !empty($currentAddressParts) ? array_key_last($currentAddressParts) : null;
             if ($lastKey !== null) {
@@ -253,7 +242,7 @@ function splitAddresses(string $addressBlock): array
             if ($part1 !== '') array_unshift($processingQueue, $part1);
             continue;
         }
-
+        
         $colonPos = mb_strpos($chunk, ':');
         if ($colonPos !== false) {
             $chunk = trim(mb_substr($chunk, $colonPos + 1));
@@ -261,7 +250,7 @@ function splitAddresses(string $addressBlock): array
                 continue;
             }
         }
-
+        
         $cleanComponent = removeLeadingNoise($chunk);
 
         $markerInfo = findMarkerInChunk($cleanComponent, $markers, $currentAddressParts);
@@ -275,7 +264,7 @@ function splitAddresses(string $addressBlock): array
                 continue;
             }
         }
-
+        
         $currentLevel = null;
         foreach ($markerlessKeywords as $keyword => $level) {
             if (mb_strtolower($cleanComponent) == mb_strtolower($keyword)) {
@@ -302,7 +291,9 @@ function splitAddresses(string $addressBlock): array
                             }
 
                             if ($shouldCombine) {
-                                $cleanComponent = $cleanComponent . ' ' . array_shift($processingQueue);
+                                $namePart = $cleanComponent;
+                                $typePart = array_shift($processingQueue);
+                                $cleanComponent = $namePart . ' ' . $typePart;
                                 $currentLevel = $level;
                                 $combined = true;
                                 break;
@@ -321,13 +312,13 @@ function splitAddresses(string $addressBlock): array
                 }
             }
         }
-
+        
         if ($currentLevel === LEVEL_HOUSE) {
             $foundAtLeastOneHouse = true;
         }
 
         $isNewAddress = ($lastLevel !== -1 && $currentLevel <= $lastLevel);
-        $newHousePartFromHanging = null;
+        $newHousePartFromHanging = null; 
 
         if ($isNewAddress && $currentLevel == LEVEL_HOUSE && $lastLevel == LEVEL_HOUSE) {
             $isSupplementToHouse = true;
@@ -341,7 +332,7 @@ function splitAddresses(string $addressBlock): array
                     $isNewAddress = false;
                 } else {
                     if ($lastHouseComponent) {
-                        $newHousePartFromHanging = replaceLastWord($lastHouseComponent, $cleanComponent);
+                         $newHousePartFromHanging = replaceLastWord($lastHouseComponent, $cleanComponent);
                     }
                 }
             }
@@ -349,15 +340,12 @@ function splitAddresses(string $addressBlock): array
         if ($isNewAddress) {
             $builtAddress = '';
             if (!empty($currentAddressParts) && (isset($currentAddressParts[LEVEL_STREET]) || isset($currentAddressParts[LEVEL_HOUSE]))) {
-                if (!isset($currentAddressParts[LEVEL_CITY])) {
-                    $foundIncompleteAddress = true; // Ставим флаг
-                }
-                ksort($currentAddressParts);
-                $builtAddress = implode(', ', $currentAddressParts);
+                 ksort($currentAddressParts);
+                 $builtAddress = implode(', ', $currentAddressParts);
             }
-
+            
             if ($builtAddress && (empty($results) || end($results) !== $builtAddress)) {
-                $results[] = $builtAddress;
+                 $results[] = $builtAddress;
             }
 
             $newParts = [];
@@ -372,7 +360,7 @@ function splitAddresses(string $addressBlock): array
             }
             $currentAddressParts = $newParts;
         }
-
+        
         if ($newHousePartFromHanging !== null) {
             $currentAddressParts[LEVEL_HOUSE] = $newHousePartFromHanging;
             $lastHouseComponent = $newHousePartFromHanging;
@@ -388,7 +376,7 @@ function splitAddresses(string $addressBlock): array
                 $lastHouseComponent = $cleanComponent;
             }
         }
-
+        
         $lastLevel = $currentLevel;
 
         if ($currentLevel === LEVEL_STREET) {
@@ -405,7 +393,7 @@ function splitAddresses(string $addressBlock): array
             }
         } else if ($currentLevel === LEVEL_HOUSE) {
             $streetMarkersForSplit = [' ул.', ' ул ', ' пр-т', ' пр ', ' б-р', ' пер '];
-            foreach ($streetMarkersForSplit as $streetMarker) {
+             foreach ($streetMarkersForSplit as $streetMarker) {
                 $streetPos = mb_stripos($currentAddressParts[LEVEL_HOUSE], $streetMarker);
                 if ($streetPos !== false) {
                     $housePart = trim(mb_substr($currentAddressParts[LEVEL_HOUSE], 0, $streetPos));
@@ -423,9 +411,6 @@ function splitAddresses(string $addressBlock): array
         }
     }
     if (!empty($currentAddressParts) && (isset($currentAddressParts[LEVEL_STREET]) || isset($currentAddressParts[LEVEL_HOUSE]))) {
-        if (!isset($currentAddressParts[LEVEL_CITY])) {
-            $foundIncompleteAddress = true; // Ставим флаг
-        }
         ksort($currentAddressParts);
         $results[] = implode(', ', $currentAddressParts);
     }
@@ -440,14 +425,11 @@ function splitAddresses(string $addressBlock): array
         }
         if (!$isJunk) $finalResults[] = $address;
     }
-
+    
     $finalResults = array_unique($finalResults);
     $finalResults = array_values($finalResults);
 
-    if ($foundIncompleteAddress) {
-        return [$addressBlock];
-    }
-    
+
     if ($infiniteLoopDetected) {
         return [$addressBlock];
     }
@@ -502,7 +484,7 @@ try {
         logMigrate("=== Сеанс миграции завершен успешно ===");
         exit;
     }
-
+    
     logMigrate("2. Извлечение закупок для обработки...");
     $stmt = $pdo->query("SELECT id, work_location FROM procurements WHERE work_location IS NOT NULL AND work_location != '' ORDER BY id");
     $procurements = $stmt->fetchAll(PDO::FETCH_ASSOC);
@@ -516,13 +498,13 @@ try {
         $pdo->exec("TRUNCATE TABLE `procurement_locations`;");
 
         logMigrate("4. Начало процесса переноса и разделения адресов...");
-
+        
         $pdo->beginTransaction();
         $processed = 0;
         $totalAddresses = 0;
         foreach ($procurements as $proc) {
             $addresses = splitAddresses($proc['work_location']);
-
+            
             foreach ($addresses as $address) {
                 if (!empty($address)) {
                     $address = preg_replace('/Российская Федерация,?\s?/', '', $address);

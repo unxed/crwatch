@@ -63,6 +63,8 @@
  *   чтобы предотвратить зацикливание на редких форматах.
  */
 
+define("MAX_ITERATIONS", 1000); // Максимально допустимое количество итераций разбора адреса
+
 ini_set('display_errors', 1);
 error_reporting(E_ALL);
 set_time_limit(300);
@@ -331,6 +333,9 @@ function splitAddresses(string $addressBlock): array
     $foundAtLeastOneHouse = false; // Флаг, был ли найден хотя бы один дом во всем блоке.
     $lastHouseComponent = null;  // Хранит текст последнего компонента дома для "висячих" литер.
     $inParenthesesMode = false;  // Флаг, находимся ли мы внутри (...) для сбора всего содержимого.
+
+    $iterations = 0;             // Счетчик итераций для предотвращения бесконечных циклов.
+    $infiniteLoopDetected = false; // Флаг, который установится в true при обнаружении цикла.    
     
     // --- 1. Начальное формирование очереди обработки ---
     // Разбиваем весь входной блок на "чанки" по разделителям.
@@ -352,8 +357,16 @@ function splitAddresses(string $addressBlock): array
 
     // --- 2. Основной цикл обработки очереди ---
     while (!empty($processingQueue)) {
+
+        $iterations++;
+        if ($iterations > MAX_ITERATIONS) {
+            log_ai("!!! ОШИБКА: Обнаружен бесконечный цикл после " . MAX_ITERATIONS . " итераций. Прерывание.");
+            $infiniteLoopDetected = true;
+            break; // Выходим из цикла while
+        }
+
         $chunk = array_shift($processingQueue);
-        
+
         // --- Обработка специальных состояний ---
         // Если мы внутри скобок, просто приклеиваем чанк к последнему компоненту.
         if ($inParenthesesMode) {
@@ -544,9 +557,6 @@ function splitAddresses(string $addressBlock): array
                     break;
                 }
             }
-
-        // Old code. Caused hangs (see "hang 1" test case)
-        /*
         } else if ($currentLevel === LEVEL_HOUSE) {
             $streetMarkersForSplit = [' ул.', ' ул ', ' пр-т', ' пр ', ' б-р', ' пер '];
              foreach ($streetMarkersForSplit as $streetMarker) {
@@ -562,27 +572,7 @@ function splitAddresses(string $addressBlock): array
                     break;
                 }
             }
-        */
         }
-
-        // New code to avoid hangs, begin
-        if ($currentLevel === LEVEL_STREET) {
-            $houseMarkersForSplit = [' д.', ' дом '];
-            foreach ($houseMarkersForSplit as $houseMarker) {
-                $housePos = mb_stripos($currentAddressParts[LEVEL_STREET], $houseMarker);
-                if ($housePos !== false) {
-                    $streetPart = trim(mb_substr($currentAddressParts[LEVEL_STREET], 0, $housePos));
-                    $housePart = trim(mb_substr($currentAddressParts[LEVEL_STREET], $housePos));
-
-                    log_ai("Post-split: Found house marker '{$houseMarker}' in street component. Splitting.");
-                    $currentAddressParts[LEVEL_STREET] = $streetPart;
-                    array_unshift($processingQueue, $housePart);
-                    log_ai("New street part: '{$streetPart}'. Re-queuing house part: '{$housePart}'.");
-                    break;
-                }
-            }
-        }
-        // New code to avoid hangs, end
 
         // Входим в режим "внутри скобок".
         if (mb_strpos($cleanComponent, '(') !== false && mb_strpos($cleanComponent, ')') === false) {
@@ -616,12 +606,28 @@ function splitAddresses(string $addressBlock): array
     $finalResults = array_unique($finalResults);
     $finalResults = array_values($finalResults);
 
-    // Если не удалось извлечь несколько полноценных адресов, возвращаем исходную строку.
-    if (count($finalResults) <= 1 || !$foundAtLeastOneHouse) {
-        log_ai("FINAL CHECK: Found " . count($finalResults) . " addresses and foundAtLeastOneHouse is " . ($foundAtLeastOneHouse ? 'true' : 'false') . ". Condition for splitting not met. Returning original block.");
+    // --- 8. Финальная проверка и возврат результата ---
+
+    // Сначала проверяем на ошибку парсинга (бесконечный цикл)
+    if ($infiniteLoopDetected) {
+        $GLOBALS['parse_reason'] = "Обнаружен бесконечный цикл";
+        log_ai("Infinite loop detected");
         return [$addressBlock];
     }
-    
+
+    // Затем проверяем, стоит ли вообще делить блок
+    if (count($finalResults) <= 1 || !$foundAtLeastOneHouse) {
+        if (!$foundAtLeastOneHouse) {
+            $reason = "Не найдено ни одного полного адреса";
+            log_ai("No full addresses found");
+        } else {
+            $reason = "Найден только один полный адрес";
+            log_ai("Only one full address found");
+        }
+        $GLOBALS['parse_reason'] = $reason;
+        return [$addressBlock];
+    }
+
     return $finalResults;
 }
 
@@ -644,15 +650,20 @@ foreach ($testCases as $caseName => $addressBlock) {
     fwrite($logAiHandle, "CASE: {$caseName}\n");
     fwrite($logAiHandle, "==================================================\n");
 
+    $GLOBALS['parse_reason'] = null; // Сбрасываем причину перед каждым запуском
     $result = splitAddresses($addressBlock);
 
-    if (empty($result)) {
-        fwrite($logManHandle, "  (No valid addresses found)\n");
+    // Проверяем, вернула ли функция исходную строку
+    if (count($result) === 1 && $result[0] === $addressBlock) {
+        // Если да, то пишем причину, которую установила функция
+        fwrite($logManHandle, $GLOBALS['parse_reason'] . "\n");
     } else {
+        // Если все хорошо, выводим результат как обычно
         foreach ($result as $index => $address) {
             fwrite($logManHandle, "  " . ($index + 1) . ". {$address}\n");
         }
     }
+    
     fwrite($logManHandle, "\n");
 }
 

@@ -1,5 +1,7 @@
 <?php
 
+define("MAX_ITERATIONS", 1000); // Максимально допустимое количество итераций разбора адреса
+
 require_once 'config.php';
 
 function logMigrate(string $message): void {
@@ -188,6 +190,9 @@ function splitAddresses(string $addressBlock): array
     $foundAtLeastOneHouse = false;
     $lastHouseComponent = null;
     $inParenthesesMode = false;
+
+    $iterations = 0;               // Счетчик итераций для предотвращения бесконечных циклов.
+    $infiniteLoopDetected = false; // Флаг, который установится в true при обнаружении цикла.    
     
     $cursor = 0;
     $length = mb_strlen($addressBlock);
@@ -206,6 +211,13 @@ function splitAddresses(string $addressBlock): array
     }
 
     while (!empty($processingQueue)) {
+
+        $iterations++;
+        if ($iterations > MAX_ITERATIONS) {
+            $infiniteLoopDetected = true;
+            break; // Выходим из цикла while
+        }        
+        
         $chunk = array_shift($processingQueue);
         
         if ($inParenthesesMode) {
@@ -379,20 +391,16 @@ function splitAddresses(string $addressBlock): array
                     break;
                 }
             }
-        }
-
-        if ($currentLevel === LEVEL_STREET) {
-            $houseMarkersForSplit = [' д.', ' дом '];
-            foreach ($houseMarkersForSplit as $houseMarker) {
-                $housePos = mb_stripos($currentAddressParts[LEVEL_STREET], $houseMarker);
-                if ($housePos !== false) {
-                    $streetPart = trim(mb_substr($currentAddressParts[LEVEL_STREET], 0, $housePos));
-                    $housePart = trim(mb_substr($currentAddressParts[LEVEL_STREET], $housePos));
-                    
-                    log_ai("Post-split: Found house marker '{$houseMarker}' in street component. Splitting.");
-                    $currentAddressParts[LEVEL_STREET] = $streetPart;
-                    array_unshift($processingQueue, $housePart);
-                    log_ai("New street part: '{$streetPart}'. Re-queuing house part: '{$housePart}'.");
+        } else if ($currentLevel === LEVEL_HOUSE) {
+            $streetMarkersForSplit = [' ул.', ' ул ', ' пр-т', ' пр ', ' б-р', ' пер '];
+             foreach ($streetMarkersForSplit as $streetMarker) {
+                $streetPos = mb_stripos($currentAddressParts[LEVEL_HOUSE], $streetMarker);
+                if ($streetPos !== false) {
+                    $housePart = trim(mb_substr($currentAddressParts[LEVEL_HOUSE], 0, $streetPos));
+                    $streetPart = trim(mb_substr($currentAddressParts[LEVEL_HOUSE], $streetPos));
+                    $currentAddressParts[LEVEL_HOUSE] = $housePart;
+                    array_unshift($processingQueue, $streetPart);
+                    $lastLevel = LEVEL_HOUSE;
                     break;
                 }
             }
@@ -421,11 +429,17 @@ function splitAddresses(string $addressBlock): array
     $finalResults = array_unique($finalResults);
     $finalResults = array_values($finalResults);
 
+
+    if ($infiniteLoopDetected) {
+        return [$addressBlock];
+    }
+
     if (count($finalResults) <= 1 || !$foundAtLeastOneHouse) {
         return [$addressBlock];
     }
-    
+
     return $finalResults;
+
 }
 
 // =============================================================================

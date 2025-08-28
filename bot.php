@@ -130,14 +130,24 @@ while (true) {
             }
 
             $sql = "
-                SELECT 
-                    p.reg_number, pl.address AS work_location, p.procurement_object,
-                    c.name AS customer_name, p.initial_price, contr.conclusion_date
-                FROM procurement_locations AS pl
-                JOIN procurements AS p ON pl.procurement_id = p.id
+                SELECT
+                    p.reg_number,
+                    pl.address AS work_location,
+                    p.procurement_object,
+                    c.name AS customer_name,
+                    p.initial_price,
+                    contr.conclusion_date,
+                    p.id
+                FROM procurements AS p
+                JOIN (
+                    SELECT procurement_id, MIN(id) AS first_pl_id
+                    FROM procurement_locations
+                    GROUP BY procurement_id
+                ) AS pl_first ON pl_first.procurement_id = p.id
+                JOIN procurement_locations AS pl ON pl.procurement_id = p.id AND pl.id = pl_first.first_pl_id
                 LEFT JOIN customers AS c ON p.customer_id = c.id
                 LEFT JOIN contracts AS contr ON p.id = contr.procurement_id
-                WHERE 1=1 
+                WHERE 1=1
             ";
 
             if (!empty($fulltext_words)) {

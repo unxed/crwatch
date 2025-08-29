@@ -356,6 +356,47 @@ function isClearlyHouseComponent(string $component, array $markers): bool
 }
 
 /**
+ * Проверяет, может ли слово быть частью компонента дома согласно строгому правилу.
+ * @param string $word Слово для проверки.
+ * @return bool True, если слово соответствует правилам компонента дома.
+ */
+function isWordPartOfHouseComponent(string $word): bool
+{
+    $cleanWord = trim(mb_strtolower($word), '.,:');
+
+    if ($cleanWord === '') return true; // Пробелы и пунктуация не должны прерывать поиск
+
+    // Правило 1: Слово из фиксированного списка
+    $houseKeywords = ['дом', 'д', 'литера', 'лит', 'корпус', 'корп', 'к', 'строение', 'стр'];
+    if (in_array($cleanWord, $houseKeywords)) {
+        return true;
+    }
+
+    // Правило 2: Слово является номером (содержит цифры)
+    if (containsDigits($cleanWord)) {
+        return true;
+    }
+
+    // Правило 3: Слово является литерой (одиночная буква)
+    if (mb_strlen(preg_replace('/[^[:alpha:]]/u', '', $cleanWord)) === 1) {
+         return true;
+    }
+
+    return false;
+}
+
+/**
+ * Проверяет, является ли строка числом (целым или дробным).
+ * @param string $str
+ * @return bool
+ */
+function isPurelyNumeric(string $str): bool {
+    $cleanStr = trim($str);
+    // Позволяет целые числа и дроби через /
+    return is_numeric(str_replace('/', '', $cleanStr));
+}
+
+/**
  * Проверяет, является ли входная строка "мусором" (описательным текстом).
  * @param array $chunks Массив чанков для анализа.
  * @param array $markers Список маркеров.
@@ -554,20 +595,40 @@ function splitAddresses(string $addressBlock): array
 
         $cleanComponent = removeLeadingNoise($chunk);
 
-        // Ключевая логика разделения "склеенных" чанков.
         $markerInfo = findMarkerInChunk($cleanComponent, $markers, $ambiguousMarkers, $currentAddressParts);
         $pos = $markerInfo['pos'] ?? -1;
         if ($pos > 0) {
             $part1 = trim(mb_substr($cleanComponent, 0, $pos));
-            // Разрываем, только если часть до маркера похожа на конец адреса (т.е. на компонент дома).
+            $shouldSplit = false;
+
+            // Правило 1 (основное): разрыв по маркеру высокого уровня (город/регион), если до него что-то похожее на дом.
             if ($markerInfo['level'] < LEVEL_STREET && isHouseComponent($part1)) {
+                $shouldSplit = true;
+                log_ai("Split condition 1 met: high-level marker '{$markerInfo['marker']}' follows a house-like component '{$part1}'.");
+            }
+            // Правило 2 (дополнительное): разрыв по маркеру улицы, если до него ЯВНЫЙ компонент дома (с маркером 'д.' и т.д.).
+            else if ($markerInfo['level'] === LEVEL_STREET && isClearlyHouseComponent($part1, $markers)) {
+                $shouldSplit = true;
+                log_ai("Split condition 2 met: street marker '{$markerInfo['marker']}' follows a clear house component '{$part1}'.");
+            }
+            // Правило 3 (новое): разрыв по маркеру улицы, если до него другой компонент высокого уровня (город, село и т.д.).
+            else if ($markerInfo['level'] === LEVEL_STREET) {
+                // Проверяем, есть ли в первой части маркер города/села
+                $part1MarkerInfo = findMarkerInChunk($part1, $markers, $ambiguousMarkers, []);
+                if ($part1MarkerInfo !== null && $part1MarkerInfo['level'] <= LEVEL_CITY) {
+                     $shouldSplit = true;
+                     log_ai("Split condition 3 met: street marker '{$markerInfo['marker']}' follows a location component '{$part1}'.");
+                }
+            }
+
+            if ($shouldSplit) {
                 $part2 = trim(mb_substr($cleanComponent, $pos));
-                log_ai("Chunk split by high-level marker ('{$markerInfo['marker']}'): '{$part1}' and '{$part2}'. Re-queuing.");
+                log_ai("Chunk split: '{$part1}' and '{$part2}'. Re-queuing.");
                 array_unshift($processingQueue, $part2);
                 array_unshift($processingQueue, $part1);
                 continue;
             } else {
-                 log_ai("Split blocked: marker level >= STREET, or part before marker is not a house component.");
+                 log_ai("Split blocked: No split conditions were met for marker '{$markerInfo['marker']}'.");
             }
         }
 
@@ -644,35 +705,69 @@ function splitAddresses(string $addressBlock): array
 
         // --- 4. Принятие решения: новый адрес или часть текущего? ---
 
-        // Шаг 1: Принимаем решение по основному правилу.
-        $isNewAddress = ($lastLevel !== -1 && $currentLevel <= $lastLevel);
+        $isNewAddress = false; // По умолчанию, считаем, что это часть текущего адреса
 
-        // Шаг 2: Создаем ИСКЛЮЧЕНИЕ для вложенных городов.
-        // Если основное правило решило, что это новый адрес, но это просто один город
-        // после другого (например, Саяногорск -> Черемушки), то отменяем это решение.
-        if ($isNewAddress && $currentLevel === LEVEL_CITY && $lastLevel === LEVEL_CITY) {
-            $isNewAddress = false;
-            log_ai("OVERRIDE: City-follows-city transition detected. Treating as part of the SAME address, not a new one.");
+        // ПРАВИЛО 1: Общее правило падения уровня иерархии
+        if ($lastLevel !== -1 && $currentLevel < $lastLevel) {
+            $isNewAddress = true;
+        } else if ($lastLevel !== -1 && $currentLevel === $lastLevel && !in_array($currentLevel, [LEVEL_HOUSE, LEVEL_CITY])) {
+             // Для всех уровней, КРОМЕ дома и города, равенство уровней = новый адрес
+             $isNewAddress = true;
         }
 
-        $newHousePartFromHanging = null; 
+        // ПРАВИЛО 2 (ПРИОРИТЕТНОЕ): Обработка последовательности "дом-за-домом"
+        if ($currentLevel === LEVEL_HOUSE && $lastLevel === LEVEL_HOUSE) {
+            // Ищем "сильный признак" - вводное слово.
+            if (mb_stripos($cleanComponent, 'д.') !== false || mb_stripos($cleanComponent, 'дом') !== false) {
+                // Если он есть, это ВСЕГДА новый отдельный дом.
+                $isNewAddress = true;
+                log_ai("Decision: Component has a 'д.'/'дом' marker, forcing NEW ADDRESS.");
+            } else {
+                // --- ПРАВИЛО 3: ПРОВЕРКА НА СТРУКТУРНОЕ ПОДОБИЕ ---
+                // Если вводного слова нет, это может быть либо дополнение, либо подобный "висячий" дом.
+                $lastHousePart = $currentAddressParts[LEVEL_HOUSE] ?? '';
+                $lastHouseWords = explode(' ', $lastHousePart);
+                $lastWordOfPrevHouse = trim(end($lastHouseWords));
+                $newHouseChunk = trim($cleanComponent);
 
-        if ($isNewAddress && $currentLevel == LEVEL_HOUSE && $lastLevel == LEVEL_HOUSE) {
-            $isSupplementToHouse = true;
-            $markerInfo = findMarkerInChunk($cleanComponent, $markers, $ambiguousMarkers, $currentAddressParts);
-            if ($markerInfo && in_array($markerInfo['marker'], ['д.', 'дом'])) {
-                $isSupplementToHouse = false;
-            }
-            if ($isSupplementToHouse) {
-                if (containsHouseKeyword($cleanComponent)) {
-                    $isNewAddress = false; // Это дополнение (корпус), а не новый адрес.
-                } else {
-                    // Это "висячая" литера, создаем для нее новый компонент дома.
+                $areSimilar = false;
+                // Сценарий 1: Оба - одиночные буквы (литеры)
+                if (mb_strlen($lastWordOfPrevHouse) === 1 && mb_strlen($newHouseChunk) === 1 &&
+                    preg_match('/^\p{L}$/u', $lastWordOfPrevHouse) && preg_match('/^\p{L}$/u', $newHouseChunk)) {
+                    $areSimilar = true;
+                    log_ai("Similarity check: both components are single letters.");
+                }
+                // Сценарий 2: Оба - числа (номера домов)
+                else if (isPurelyNumeric($lastWordOfPrevHouse) && isPurelyNumeric($newHouseChunk)) {
+                    $areSimilar = true;
+                    log_ai("Similarity check: both components are numeric.");
+                }
+
+                if ($areSimilar) {
+                    // Структурно подобны -> это новый самостоятельный дом.
+                    $isNewAddress = true;
+
+                    // --- Модифицируем текущий чанк ---
+                    // "Реконструируем" полный адрес дома, чтобы не потерять контекст.
                     if ($lastHouseComponent) {
-                         $newHousePartFromHanging = replaceLastWord($lastHouseComponent, $cleanComponent);
+                         $reconstructedChunk = replaceLastWord($lastHouseComponent, $newHouseChunk);
+                         log_ai("Decision: Similar component found. Reconstructing '{$newHouseChunk}' to '{$reconstructedChunk}'. Forcing NEW ADDRESS.");
+                         $cleanComponent = $reconstructedChunk; // Подменяем чанк на полную версию.
+                    } else {
+                        log_ai("Decision: Similar component found, but no last house to reconstruct from. Forcing NEW ADDRESS.");
                     }
+                } else {
+                    // Неподобны -> это дополнение (корпус после литеры и т.д.).
+                    $isNewAddress = false;
+                    log_ai("Decision: Component is a supplement (not similar), treating as PART OF CURRENT ADDRESS.");
                 }
             }
+        }
+
+        // ПРАВИЛО 4 (ИСКЛЮЧЕНИЕ): Город за городом - это вложенность, а не новый адрес.
+        if ($isNewAddress && $currentLevel === LEVEL_CITY && $lastLevel === LEVEL_CITY) {
+            $isNewAddress = false;
+            log_ai("OVERRIDE: City-follows-city is nesting, not a new address.");
         }
 
         // --- 5. Сборка адреса ---
@@ -715,7 +810,7 @@ function splitAddresses(string $addressBlock): array
         }
 
         // Добавляем текущий компонент в собираемый адрес.
-        if ($newHousePartFromHanging !== null) {
+        if ($newHousePartFromHanging ?? null) {
             $currentAddressParts[LEVEL_HOUSE] = $newHousePartFromHanging;
             $lastHouseComponent = $newHousePartFromHanging;
         } else if ($currentLevel == LEVEL_HOUSE && isset($currentAddressParts[LEVEL_HOUSE]) && !$isNewAddress) {
@@ -723,10 +818,24 @@ function splitAddresses(string $addressBlock): array
             $lastHouseComponent = $currentAddressParts[LEVEL_HOUSE];
         } else {
 
-            // Специфичная эвристика для вложенных населенных пунктов.
-            // Если у нас уже есть город (например, Саяногорск), и приходит новый компонент
-            // того же уровня (например, Черемушки рп), мы не заменяем, а добавляем его как дочерний.
             if ($currentLevel === LEVEL_CITY && isset($currentAddressParts[LEVEL_CITY]) && !$isNewAddress) {
+                // --- Блок для предотвращения дублирования городов ---
+                // Убираем маркеры для сравнения "чистых" названий
+                $existingCityClean = trim(str_replace(['г.', 'г', 'город'], '', $currentAddressParts[LEVEL_CITY]));
+                $newCityClean = trim(str_replace(['г.', 'г', 'город'], '', $cleanComponent));
+
+                // Если это по сути тот же город, не добавляем, а пропускаем или заменяем.
+                // Сравнение mb_strpos позволяет ловить случаи, когда одно название является частью другого.
+                if (mb_stripos($existingCityClean, $newCityClean) !== false || mb_stripos($newCityClean, $existingCityClean) !== false) {
+                    log_ai("Skipping duplicate/redundant city component '{$cleanComponent}'. Existing: '{$currentAddressParts[LEVEL_CITY]}'");
+                    // Опционально: можно заменить на более полную версию, если она длиннее
+                    if (mb_strlen($cleanComponent) > mb_strlen($currentAddressParts[LEVEL_CITY])) {
+                        $currentAddressParts[LEVEL_CITY] = $cleanComponent;
+                    }
+                    continue; // Пропускаем, чтобы не добавлять дубль
+                }
+                // --- Конец блока для предотвращения дублирования городов ---
+
                 $currentAddressParts[LEVEL_CITY] .= ', ' . $cleanComponent;
                 log_ai("Appending sub-city '{$cleanComponent}' to existing city '{$currentAddressParts[LEVEL_CITY]}'.");
                 $lastLevel = $currentLevel; // Важно обновить состояние
@@ -776,44 +885,121 @@ function splitAddresses(string $addressBlock): array
                 }
             }
 
+            // --- Блок для "отщепления" дома без маркера ---
+            // Эвристика: если последний "слово" в компоненте улицы начинается с цифры,
+            // считаем его номером дома, отрезаем и возвращаем в очередь.
             $streetComponent = $currentAddressParts[LEVEL_STREET];
-            $lastSpacePos = mb_strrpos($streetComponent, ' ');
 
-            if ($lastSpacePos !== false) {
-                $potentialHousePart = trim(mb_substr($streetComponent, $lastSpacePos + 1));
-
-                // Проверяем, что последняя часть начинается с цифры
-                if (is_numeric(mb_substr($potentialHousePart, 0, 1))) {
-                    $streetPart = trim(mb_substr($streetComponent, 0, $lastSpacePos));
-
-                    // Список исключений: маркеры улиц, которые ИСПОЛЬЗУЮТ номер как часть названия.
-                    // Для них отрывать номер нельзя.
-                    $numericStreetMarkers = ['квл', 'мкр', 'мкрн', 'микрорайон', 'линия'];
-
-                    // Отрываем номер дома, только если оставшаяся часть улицы не является исключением.
-                    if (!empty($streetPart) && !in_array(mb_strtolower($streetPart), $numericStreetMarkers)) {
-                        log_ai("Post-split heuristic: Found unmarked house component '{$potentialHousePart}' at the end of street '{$streetComponent}'. Splitting.");
-                        $currentAddressParts[LEVEL_STREET] = $streetPart;
-                        array_unshift($processingQueue, $potentialHousePart);
-                    } else {
-                        log_ai("Post-split heuristic blocked: Street part '{$streetPart}' is in the numeric markers exception list. Not splitting.");
-                    }
+            // Список исключений: маркеры улиц, где номер является частью названия.
+            $streetSplitExceptions = ['квл', 'квартал', 'мкр', 'микрорайон', 'линия'];
+            $isException = false;
+            foreach ($streetSplitExceptions as $exception) {
+                if (mb_stripos($streetComponent, $exception) !== false) {
+                    $isException = true;
+                    break;
                 }
             }
 
-        } else if ($currentLevel === LEVEL_HOUSE) {
-            $streetMarkersForSplit = [' ул.', ' ул ', ' пр-т', ' пр ', ' б-р', ' пер '];
-             foreach ($streetMarkersForSplit as $streetMarker) {
-                $streetPos = mb_stripos($currentAddressParts[LEVEL_HOUSE], $streetMarker);
-                if ($streetPos !== false) {
-                    $housePart = trim(mb_substr($currentAddressParts[LEVEL_HOUSE], 0, $streetPos));
-                    $streetPart = trim(mb_substr($currentAddressParts[LEVEL_HOUSE], $streetPos));
-                    log_ai("Post-split: Found street marker '{$streetMarker}' in house component. Splitting.");
-                    $currentAddressParts[LEVEL_HOUSE] = $housePart;
-                    array_unshift($processingQueue, $streetPart);
-                    log_ai("New house part: '{$housePart}'. Re-queuing street part: '{$streetPart}'.");
-                    $lastLevel = LEVEL_HOUSE;
-                    break;
+            if (!$isException) {
+                $streetComponent = $currentAddressParts[LEVEL_STREET];
+                $splitPos = -1;
+                $foundDigit = false;
+                
+                // Идем по строке с конца, ищем пробел, после которого идет цифра
+                for ($i = mb_strlen($streetComponent) - 1; $i > 0; $i--) {
+                    $char = mb_substr($streetComponent, $i, 1);
+                    $prev_char = mb_substr($streetComponent, $i - 1, 1);
+
+                    if (is_numeric($char) && $prev_char === ' ') {
+                        // Нашли связку "пробел + цифра". Это наш кандидат на точку разделения.
+                        $splitPos = $i;
+                        $foundDigit = true;
+                        
+                        // ПРОВЕРКА-ЗАЩИТА: Не является ли эта цифра частью названия?
+                        // (эвристика: если до этой точки всего одно слово, то это, скорее всего, название)
+                        $partBefore = trim(mb_substr($streetComponent, 0, $splitPos));
+                        if (mb_strpos($partBefore, ' ') === false) {
+                            // До точки разреза всего одно слово (например, "ул."). Это похоже на название "ул. 1-го Мая". Не режем.
+                            log_ai("Post-split blocked by safety check: potential house number is likely part of the street name in '{$streetComponent}'.");
+                            $splitPos = -1; // Отменяем разделение
+                        }
+                        
+                        break; // Выходим из цикла, так как нашли первое число с конца
+                    }
+                }
+
+                if ($splitPos !== -1) {
+                    $streetPart = trim(mb_substr($streetComponent, 0, $splitPos));
+                    $potentialHousePart = trim(mb_substr($streetComponent, $splitPos));
+
+                    if (!empty($streetPart) && !empty($potentialHousePart)) {
+                        log_ai("Post-split heuristic (safe mode): Found unmarked house component '{$potentialHousePart}' in '{$streetComponent}'. Splitting.");
+                        $currentAddressParts[LEVEL_STREET] = $streetPart;
+                        array_unshift($processingQueue, $potentialHousePart);
+                    }
+                }
+            } else {
+                log_ai("Post-split blocked: Street '{$streetComponent}' contains an exception keyword.");
+            }
+            // --- Конец блок для "отщепления" дома без маркера ---
+
+        } else if ($currentLevel === LEVEL_HOUSE && isset($currentAddressParts[LEVEL_HOUSE])) {
+            $componentText = $currentAddressParts[LEVEL_HOUSE];
+
+            // --- ЭТАП 1: Поиск наиболее раннего маркера улицы внутри компонента дома ---
+            $streetMarkers = [];
+            foreach ($markers as $marker => $level) if ($level === LEVEL_STREET) $streetMarkers[] = $marker;
+
+            $bestStreetPos = -1;
+            foreach ($streetMarkers as $streetMarker) {
+                $pos = mb_stripos($componentText, ' ' . trim($streetMarker));
+                if ($pos !== false && ($bestStreetPos === -1 || $pos < $bestStreetPos)) $bestStreetPos = $pos;
+            }
+
+            // --- ЭТАП 2: Если маркер найден, ищем границу и принимаем решение на основе контекста ---
+            if ($bestStreetPos !== -1) {
+                // --- АЛГОРИТМ ИЗВЛЕЧЕНИЯ ПОЛНОЙ ФРАЗЫ УЛИЦЫ ---
+                $words = explode(' ', $componentText);
+                $splitIndex = -1;
+                for ($i = count($words) - 1; $i >= 0; $i--) {
+                    if (!isWordPartOfHouseComponent($words[$i])) {
+                        $splitIndex = $i;
+                    } else if ($splitIndex !== -1) {
+                        break;
+                    }
+                }
+
+                if ($splitIndex !== -1) {
+                    $houseWords = array_slice($words, 0, $splitIndex);
+                    $streetWords = array_slice($words, $splitIndex);
+                    $housePart = trim(implode(' ', $houseWords));
+                    $streetPart = trim(implode(' ', $streetWords));
+
+                    // --- КЛЮЧЕВОЕ РЕШЕНИЕ НА ОСНОВЕ ПРАВИЛА ---
+                    $contextStreet = $currentAddressParts[LEVEL_STREET] ?? null;
+
+                    // Сравниваем улицы, игнорируя пунктуацию и регистр
+                    $cleanContextStreet = str_replace(['.',' '], '', mb_strtolower($contextStreet));
+                    $cleanStreetPart = str_replace(['.',' '], '', mb_strtolower($streetPart));
+
+                    // Если улицы СОВПАДАЮТ -> это избыточный дубликат
+                    if ($contextStreet && (mb_strpos($cleanContextStreet, $cleanStreetPart) !== false || mb_strpos($cleanStreetPart, $cleanContextStreet) !== false)) {
+                        log_ai("Post-split: Found and removed redundant street phrase '{$streetPart}'.");
+                        $currentAddressParts[LEVEL_HOUSE] = $housePart; // Просто чистим компонент дома
+                        $lastHouseComponent = $housePart;
+                        // НЕ ДЕЛАЕМ re-queue, просто продолжаем
+                    }
+                    // Если улицы РАЗНЫЕ -> это начало нового адреса
+                    else {
+                        log_ai("Post-split: Found new address part '{$streetPart}'. Re-queuing.");
+                        unset($currentAddressParts[LEVEL_HOUSE]);
+                        array_unshift($processingQueue, $streetPart);
+                        if (!empty($housePart)) {
+                             array_unshift($processingQueue, $housePart);
+                        }
+                        $lastLevel = -1;
+                        continue;
+                    }
                 }
             }
         }

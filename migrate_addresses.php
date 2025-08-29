@@ -535,6 +535,29 @@ function splitAddresses(string $addressBlock): array
                     break;
                 }
             }
+ 
+            $streetComponent = $currentAddressParts[LEVEL_STREET];
+            $lastSpacePos = mb_strrpos($streetComponent, ' ');
+
+            if ($lastSpacePos !== false) {
+                $potentialHousePart = trim(mb_substr($streetComponent, $lastSpacePos + 1));
+
+                // Проверяем, что последняя часть начинается с цифры
+                if (is_numeric(mb_substr($potentialHousePart, 0, 1))) {
+                    $streetPart = trim(mb_substr($streetComponent, 0, $lastSpacePos));
+
+                    // Список исключений: маркеры улиц, которые ИСПОЛЬЗУЮТ номер как часть названия.
+                    // Для них отрывать номер нельзя.
+                    $numericStreetMarkers = ['квл', 'мкр', 'мкрн', 'микрорайон', 'линия'];
+
+                    // Отрываем номер дома, только если оставшаяся часть улицы не является исключением.
+                    if (!empty($streetPart) && !in_array(mb_strtolower($streetPart), $numericStreetMarkers)) {
+                        $currentAddressParts[LEVEL_STREET] = $streetPart;
+                        array_unshift($processingQueue, $potentialHousePart);
+                    }
+                }
+            }
+        
         } else if ($currentLevel === LEVEL_HOUSE) {
             $streetMarkersForSplit = [' ул.', ' ул ', ' пр-т', ' пр ', ' б-р', ' пер '];
              foreach ($streetMarkersForSplit as $streetMarker) {

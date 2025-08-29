@@ -239,13 +239,22 @@ function findMarkerInChunk(string $chunk, array $markers, array $ambiguousMarker
 
             // Маркер должен быть отдельным словом
             if (in_array($before, [' ', '(']) && $isAfterOk) {
+
                 // Контекстная проверка для маркера "г" (город или литера Г)
                 if ($marker === 'г' || $marker === 'г.') {
                     if ($pos > 0) {
                         $chunkBeforeMarker = trim(mb_substr($chunk, 0, $pos));
                         if (!empty($chunkBeforeMarker) && is_numeric(mb_substr($chunkBeforeMarker, -1))) {
-                            log_ai("Marker '{$marker}' found, but preceded by a digit. Ignoring it as a city marker.");
-                            continue; // Это литера, а не город, пропускаем
+                            // Условие: перед маркером стоит цифра.
+                            // Теперь проверяем, что идет ПОСЛЕ, чтобы отличить "25 Г" от "30 г. Знаменск".
+                            $contentAfterMarker = trim(mb_substr($chunk, $pos + $markerLen));
+
+                            // Игнорируем маркер (считаем его литерой), только если после него НЕТ слова.
+                            // Пустая строка или одиночная буква - это не слово.
+                            if (empty($contentAfterMarker) || !containsLetters($contentAfterMarker)) {
+                                log_ai("Marker '{$marker}' is preceded by a digit and NOT followed by a word. Assuming it's a building letter. Ignoring.");
+                                continue; // Это литера, а не город, пропускаем
+                            }
                         }
                     }
                 }
@@ -436,6 +445,29 @@ function splitAddresses(string $addressBlock): array
 
         $chunk = array_shift($processingQueue);
 
+        // --- "Умная" очистка чанка от контекста ---
+        if (!empty($currentAddressParts)) {
+            foreach ($currentAddressParts as $part) {
+                $part = trim($part);
+                $partLen = mb_strlen($part);
+
+                // Условие 1: чанк начинается с известной части
+                if (mb_stripos($chunk, $part) === 0) {
+                    // Условие 2: это полное совпадение ИЛИ после совпадения идет пробел
+                    $isWholeWordMatch = (mb_strlen($chunk) === $partLen) || (mb_substr($chunk, $partLen, 1) === ' ');
+
+                    if ($isWholeWordMatch) {
+                        $cleanerChunk = trim(mb_substr($chunk, $partLen));
+                        if ($cleanerChunk !== '') {
+                            log_ai("Smart context cleanup: Removed whole-word prefix '{$part}' from chunk '{$chunk}'. New chunk: '{$cleanerChunk}'");
+                            $chunk = $cleanerChunk;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         // --- Обработка специальных состояний ---
         // Если мы внутри скобок, просто приклеиваем чанк к последнему компоненту.
         if ($inParenthesesMode) {
@@ -469,6 +501,57 @@ function splitAddresses(string $addressBlock): array
         }
 
         log_ai("--- PROCESSING CHUNK: '{$chunk}' ---");
+
+        // --- Декомпозиция только для СВЕРХсложных чанков (порог >= 3) ---
+        $tempChunk = $chunk;
+        $offset = 0;
+        $markersInChunk = [];
+
+        // Создаем временный список маркеров БЕЗ коротких неоднозначных для более надежного подсчета
+        $tempMarkersForCounting = $markers;
+        unset($tempMarkersForCounting['п.']);
+        unset($tempMarkersForCounting['п']);
+        unset($tempMarkersForCounting['г']);
+
+        // Считаем, сколько маркеров в этом чанке
+        while (true) {
+            $markerInfo = findMarkerInChunk($tempChunk, $tempMarkersForCounting, $ambiguousMarkers, $currentAddressParts);
+            if ($markerInfo === null) {
+                break; // Маркеров больше нет
+            }
+
+            // Сохраняем информацию о маркере и его реальной позиции в исходном чанке
+            $markerInfo['real_pos'] = $offset + $markerInfo['pos'];
+            $markersInChunk[] = $markerInfo;
+
+            // Сдвигаем позицию для поиска в оставшейся части строки
+            $newOffset = $markerInfo['pos'] + mb_strlen($markerInfo['marker']);
+            $offset += $newOffset;
+            $tempChunk = mb_substr($tempChunk, $newOffset);
+
+            if (empty($tempChunk)) {
+                break;
+            }
+        }
+
+        // ПРИМЕНЯЕМ ПРАВИЛО: если маркеров 3 или больше, это точно "склеенный" адрес. Делим его.
+        if (count($markersInChunk) >= 3) {
+            // Нам нужно разрезать чанк после первого компонента.
+            // Граница разреза - это позиция начала ВТОРОГО маркера.
+            $splitPos = $markersInChunk[1]['real_pos'];
+
+            $part1 = trim(mb_substr($chunk, 0, $splitPos));
+            $part2 = trim(mb_substr($chunk, $splitPos));
+
+            if ($part1 !== '' && $part2 !== '') {
+                log_ai("Decomposition by threshold (>=3): Chunk has too many markers. Splitting into '{$part1}' and '{$part2}'. Re-queuing.");
+                // Возвращаем обе части в начало очереди
+                array_unshift($processingQueue, $part2);
+                array_unshift($processingQueue, $part1);
+                continue; // Переходим к следующей итерации, чтобы обработать part1
+            }
+        }
+
         $cleanComponent = removeLeadingNoise($chunk);
 
         // Ключевая логика разделения "склеенных" чанков.
@@ -541,8 +624,17 @@ function splitAddresses(string $addressBlock): array
                     else if (isHouseComponent($cleanComponent)) {
                         $currentLevel = LEVEL_HOUSE;
                     } else {
-                        log_ai("No marker/digits/keywords. Skipping as noise: '{$cleanComponent}'");
-                        continue;
+                        // МАКСИМАЛЬНО СПЕЦИФИЧНАЯ ЭВРИСТИКА:
+                        // Если предыдущий компонент был регионом (или районом),
+                        // а текущий чанк без маркера похож на название города (нет цифр, не похож на дом),
+                        // то это, скорее всего, и есть город.
+                        if (($lastLevel === LEVEL_REGION || $lastLevel === LEVEL_DISTRICT) && !containsDigits($cleanComponent) && !containsHouseKeyword($cleanComponent)) {
+                            $currentLevel = LEVEL_CITY;
+                            log_ai("Heuristic guess: Unmarked component '{$cleanComponent}' after a region/district is assumed to be a city.");
+                        } else {
+                            log_ai("No marker/digits/keywords. Skipping as noise: '{$cleanComponent}'");
+                            continue;
+                        }
                     }
                 }
             }
@@ -551,7 +643,18 @@ function splitAddresses(string $addressBlock): array
         if ($currentLevel === LEVEL_HOUSE) $foundAtLeastOneHouse = true;
 
         // --- 4. Принятие решения: новый адрес или часть текущего? ---
+
+        // Шаг 1: Принимаем решение по основному правилу.
         $isNewAddress = ($lastLevel !== -1 && $currentLevel <= $lastLevel);
+
+        // Шаг 2: Создаем ИСКЛЮЧЕНИЕ для вложенных городов.
+        // Если основное правило решило, что это новый адрес, но это просто один город
+        // после другого (например, Саяногорск -> Черемушки), то отменяем это решение.
+        if ($isNewAddress && $currentLevel === LEVEL_CITY && $lastLevel === LEVEL_CITY) {
+            $isNewAddress = false;
+            log_ai("OVERRIDE: City-follows-city transition detected. Treating as part of the SAME address, not a new one.");
+        }
+
         $newHousePartFromHanging = null; 
 
         if ($isNewAddress && $currentLevel == LEVEL_HOUSE && $lastLevel == LEVEL_HOUSE) {
@@ -619,12 +722,39 @@ function splitAddresses(string $addressBlock): array
             $currentAddressParts[LEVEL_HOUSE] .= ', ' . $cleanComponent;
             $lastHouseComponent = $currentAddressParts[LEVEL_HOUSE];
         } else {
+
+            // Специфичная эвристика для вложенных населенных пунктов.
+            // Если у нас уже есть город (например, Саяногорск), и приходит новый компонент
+            // того же уровня (например, Черемушки рп), мы не заменяем, а добавляем его как дочерний.
+            if ($currentLevel === LEVEL_CITY && isset($currentAddressParts[LEVEL_CITY]) && !$isNewAddress) {
+                $currentAddressParts[LEVEL_CITY] .= ', ' . $cleanComponent;
+                log_ai("Appending sub-city '{$cleanComponent}' to existing city '{$currentAddressParts[LEVEL_CITY]}'.");
+                $lastLevel = $currentLevel; // Важно обновить состояние
+                ksort($currentAddressParts);
+                log_ai("Current address parts: " . implode(' | ', $currentAddressParts));
+                continue; // Пропускаем остальную логику добавления/сброса для этого чанка
+            }
+
+            // Если компонент того же уровня уже существует (например, район -> новый район)
+            if (isset($currentAddressParts[$currentLevel])) {
+                $existingPart = $currentAddressParts[$currentLevel];
+                // И если новый компонент начинается с текста старого, очищаем его
+                if (mb_stripos($cleanComponent, $existingPart) === 0) {
+                    $cleanComponent = trim(mb_substr($cleanComponent, mb_strlen($existingPart)));
+                    log_ai("Self-cleanup: Component '{$currentAddressParts[$currentLevel]}' is a prefix of '{$chunk}'. Stripping it.");
+                }
+            }
+
             foreach($currentAddressParts as $lvl => $part) {
                 if ($lvl >= $currentLevel) unset($currentAddressParts[$lvl]);
             }
-            $currentAddressParts[$currentLevel] = $cleanComponent;
-            if ($currentLevel === LEVEL_HOUSE) {
-                $lastHouseComponent = $cleanComponent;
+
+            // Если после очистки что-то осталось, добавляем.
+            if ($cleanComponent !== '') {
+                $currentAddressParts[$currentLevel] = $cleanComponent;
+                if ($currentLevel === LEVEL_HOUSE) {
+                    $lastHouseComponent = $cleanComponent;
+                }
             }
         }
 

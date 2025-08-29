@@ -37,18 +37,21 @@ function containsDigits(string $str): bool
     return strcspn($str, '0123456789') !== strlen($str);
 }
 
-function findNumericListMarker(string $chunk): ?array
+function findNumericListMarker(string $chunk): ?int
 {
     $len = mb_strlen($chunk);
+    // Начинаем с 1, так как маркер в самом начале обработает removeLeadingNoise.
     for ($i = 1; $i < $len; $i++) {
         if (mb_substr($chunk, $i, 1) === ')') {
             if (is_numeric(mb_substr($chunk, $i - 1, 1))) {
+                // Нашли "цифра)". Теперь найдем начало этой цифровой последовательности.
                 $startPos = $i - 1;
                 while ($startPos > 0 && is_numeric(mb_substr($chunk, $startPos - 1, 1))) {
                     $startPos--;
                 }
+                // Убедимся, что перед нумератором стоит пробел.
                 if ($startPos > 0 && mb_substr($chunk, $startPos - 1, 1) === ' ') {
-                    return ['pos' => $startPos, 'len' => $i - $startPos + 1];
+                    return $startPos;
                 }
             }
         }
@@ -93,71 +96,64 @@ function containsLetters(string $str): bool
     return preg_match('/\p{L}/u', $str) > 0;
 }
 
-function findMarkerInChunk(string $chunk, array $markers, array $ambiguousMarkers, array $currentAddressParts, int $offset = 0): ?array
+function findMarkerInChunk(string $chunk, array $markers, array $ambiguousMarkers, array $currentAddressParts): ?array
 {
-    $bestMatch = null;
-
     foreach ($markers as $marker => $level) {
-        $pos = mb_stripos($chunk, $marker, $offset);
+        $pos = mb_stripos($chunk, $marker);
         if ($pos !== false) {
             $markerLen = mb_strlen($marker);
             $before = ($pos > 0) ? mb_substr($chunk, $pos - 1, 1) : ' ';
             $isAfterOk = false;
             if ($pos + $markerLen >= mb_strlen($chunk)) {
-                $isAfterOk = true;
+                $isAfterOk = true; // Маркер в самом конце строки
             } else {
                 $after = mb_substr($chunk, $pos + $markerLen, 1);
                 if (in_array($after, [' ', '.', ')', '/']) || is_numeric($after)) {
-                    $isAfterOk = true;
+                    $isAfterOk = true; // После маркера пробел, пунктуация или цифра
                 }
             }
-            
-            if (in_array($before, [' ', '(', "\n"]) && $isAfterOk) {
-                if ($bestMatch === null || $pos < $bestMatch['pos']) {
-                    $bestMatch = ['marker' => $marker, 'level' => $level, 'pos' => $pos, 'len' => $markerLen];
+
+            // Маркер должен быть отдельным словом
+            if (in_array($before, [' ', '(']) && $isAfterOk) {
+
+                // Контекстная проверка для маркера "г" (город или литера Г)
+                if ($marker === 'г' || $marker === 'г.') {
+                    if ($pos > 0) {
+                        $chunkBeforeMarker = trim(mb_substr($chunk, 0, $pos));
+                        if (!empty($chunkBeforeMarker) && is_numeric(mb_substr($chunkBeforeMarker, -1))) {
+                            $contentAfterMarker = trim(mb_substr($chunk, $pos + $markerLen));
+                            if (empty($contentAfterMarker) || !containsLetters($contentAfterMarker)) {
+                                continue; // Это литера, а не город, пропускаем
+                            }
+                        }
+                    }
                 }
+
+                // Контекстная проверка для "п." (поселок или пункт)
+                if ($marker === 'п.' || $marker === 'п') {
+                    $contentAfter = trim(mb_substr($chunk, $pos + $markerLen));
+                    if (!empty($contentAfter) && is_numeric(mb_substr($contentAfter, 0, 1))) {
+                        continue;
+                    }
+                }
+
+                $currentLevel = $level;
+                // Контекстная проверка для "д." (дом или деревня)
+                if ($marker === 'д.') {
+                    $hasLocationContext = isset($currentAddressParts[LEVEL_STREET]) || isset($currentAddressParts[LEVEL_CITY]);
+                    $chunkWithoutMarker = trim(str_ireplace('д.', '', $chunk));
+                    if ($hasLocationContext && containsDigits($chunkWithoutMarker)) {
+                         $currentLevel = LEVEL_HOUSE;
+                    } else {
+                         $currentLevel = LEVEL_CITY;
+                    }
+                }
+                return ['marker' => $marker, 'level' => $currentLevel, 'pos' => $pos];
             }
         }
     }
-
-    if ($bestMatch !== null) {
-        $marker = $bestMatch['marker'];
-        $pos = $bestMatch['pos'];
-
-        if ($marker === 'г' || $marker === 'г.') {
-            if ($pos > 0) {
-                $chunkBeforeMarker = trim(mb_substr($chunk, 0, $pos));
-                if (!empty($chunkBeforeMarker) && is_numeric(mb_substr($chunkBeforeMarker, -1))) {
-                    return findMarkerInChunk($chunk, $markers, $ambiguousMarkers, $currentAddressParts, $pos + 1);
-                }
-            }
-        }
-
-        if ($marker === 'п.' || $marker === 'п') {
-            $contentAfter = trim(mb_substr($chunk, $pos + $bestMatch['len']));
-            if (!empty($contentAfter) && is_numeric(mb_substr($contentAfter, 0, 1))) {
-                return findMarkerInChunk($chunk, $markers, $ambiguousMarkers, $currentAddressParts, $pos + 1);
-            }
-            $lastLevel = empty($currentAddressParts) ? -1 : array_key_last($currentAddressParts);
-            if ($lastLevel === LEVEL_STREET) {
-                return findMarkerInChunk($chunk, $markers, $ambiguousMarkers, $currentAddressParts, $pos + 1);
-            }
-        }
-
-        if ($marker === 'д.') {
-            $hasLocationContext = isset($currentAddressParts[LEVEL_STREET]) || isset($currentAddressParts[LEVEL_CITY]);
-            if ($hasLocationContext && containsDigits($chunk)) {
-                 $bestMatch['level'] = LEVEL_HOUSE;
-            } else {
-                 $bestMatch['level'] = LEVEL_CITY;
-            }
-        }
-        return $bestMatch;
-    }
-
     return null;
 }
-
 
 function containsHouseKeyword(string $str): bool
 {
@@ -170,10 +166,11 @@ function containsHouseKeyword(string $str): bool
     return false;
 }
 
-function isHouseComponent(string $component, array $markers): bool
+function isHouseComponent(string $component): bool
 {
-    foreach ($markers as $marker => $level) {
-        if ($level < LEVEL_HOUSE && mb_stripos($component, $marker) !== false) {
+    $junkHouseKeywords = ['позиция', 'объект', 'многоквартирные'];
+     foreach ($junkHouseKeywords as $keyword) {
+        if (mb_stripos($component, $keyword) !== false) {
             return false;
         }
     }
@@ -183,8 +180,12 @@ function isHouseComponent(string $component, array $markers): bool
     $hasDigits = containsDigits($component);
     
     if (!$hasDigits && containsLetters($component)) {
-        return mb_strlen(trim($component)) === 1;
+        if (mb_strlen(trim($component)) === 1) {
+            return true;
+        }
+        return false;
     }
+
     return $hasDigits || containsLetters($component);
 }
 
@@ -212,54 +213,6 @@ function isJunkInput(array $chunks, array $markers, array $ambiguousMarkers): bo
     return false;
 }
 
-function processFusedChunk(string $chunk, array $markers, array $ambiguousMarkers): array
-{
-    $subChunks = [];
-    $lastCutPos = 0;
-
-    $firstMarkerInfo = findMarkerInChunk($chunk, $markers, $ambiguousMarkers, [], 0);
-    if ($firstMarkerInfo === null) {
-        return [$chunk];
-    }
-
-    $currentTextBuffer = trim(mb_substr($chunk, 0, $firstMarkerInfo['pos']));
-    $lastMarkerInfo = $firstMarkerInfo;
-
-    while (true) {
-        $nextMarkerInfo = findMarkerInChunk($chunk, $markers, $ambiguousMarkers, [], $lastMarkerInfo['pos'] + 1);
-
-        if ($nextMarkerInfo) {
-            $textBetween = trim(mb_substr($chunk, $lastMarkerInfo['pos'] + $lastMarkerInfo['len'], $nextMarkerInfo['pos'] - ($lastMarkerInfo['pos'] + $lastMarkerInfo['len'])));
-            $subChunks[] = trim($currentTextBuffer . ' ' . $lastMarkerInfo['marker'] . ' ' . $textBetween);
-
-            $currentTextBuffer = '';
-            $lastMarkerInfo = $nextMarkerInfo;
-        } else {
-            $remainingText = trim(mb_substr($chunk, $lastMarkerInfo['pos'] + $lastMarkerInfo['len']));
-            $subChunks[] = trim($currentTextBuffer . ' ' . $lastMarkerInfo['marker'] . ' ' . $remainingText);
-            break;
-        }
-    }
-
-    return $subChunks;
-}
-
-function isFusedChunk(string $chunk, array $markers, array $ambiguousMarkers): bool
-{
-    if (mb_strlen($chunk) < 25) {
-        return false;
-    }
-
-    $markerCount = 0;
-    $offset = 0;
-    while (($markerInfo = findMarkerInChunk($chunk, $markers, $ambiguousMarkers, [], $offset)) !== null) {
-        $markerCount++;
-        $offset = $markerInfo['pos'] + $markerInfo['len'];
-    }
-
-    return $markerCount > 2;
-}
-
 /**
  * Разделяет текстовый блок, содержащий один или несколько адресов, на массив отдельных адресов.
  * Функция спроектирована для работы с "грязными" данными без использования регулярных выражений и токенизации.
@@ -284,7 +237,7 @@ function splitAddresses(string $addressBlock): array
     $ambiguousMarkers = [];
 
     $markerlessKeywords = ['Санкт-Петербург' => LEVEL_REGION, 'Москва' => LEVEL_REGION, 'Севастополь' => LEVEL_REGION];
-
+    
     // --- Переменные состояния парсера ---
     $results = [];
     $currentAddressParts = [];
@@ -325,12 +278,22 @@ function splitAddresses(string $addressBlock): array
         }
 
         $chunk = array_shift($processingQueue);
-
-        if (isFusedChunk($chunk, $markers, $ambiguousMarkers)) {
-            $subChunks = processFusedChunk($chunk, $markers, $ambiguousMarkers);
-            if (!empty($subChunks)) {
-                 array_unshift($processingQueue, ...$subChunks);
-                 continue;
+        
+        if (!empty($currentAddressParts)) {
+            foreach ($currentAddressParts as $part) {
+                $part = trim($part);
+                $partLen = mb_strlen($part);
+                
+                if (mb_stripos($chunk, $part) === 0) {
+                    $isWholeWordMatch = (mb_strlen($chunk) === $partLen) || (mb_substr($chunk, $partLen, 1) === ' ');
+                    if ($isWholeWordMatch) {
+                        $cleanerChunk = trim(mb_substr($chunk, $partLen));
+                        if ($cleanerChunk !== '') {
+                            $chunk = $cleanerChunk;
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -346,9 +309,9 @@ function splitAddresses(string $addressBlock): array
             continue;
         }
 
-        if (($markerInfo = findNumericListMarker($chunk)) !== null) {
-            $part1 = trim(mb_substr($chunk, 0, $markerInfo['pos']));
-            $part2 = trim(mb_substr($chunk, $markerInfo['pos'] + $markerInfo['len']));
+        if (($numericMarkerPos = findNumericListMarker($chunk)) !== null) {
+            $part1 = trim(mb_substr($chunk, 0, $numericMarkerPos));
+            $part2 = trim(mb_substr($chunk, $numericMarkerPos));
             if ($part2 !== '') array_unshift($processingQueue, $part2);
             if ($part1 !== '') array_unshift($processingQueue, $part1);
             continue;
@@ -359,13 +322,45 @@ function splitAddresses(string $addressBlock): array
             if (empty($chunk)) continue;
         }
 
-        $cleanComponent = removeLeadingNoise($chunk);
+        $tempChunk = $chunk;
+        $offset = 0;
+        $markersInChunk = [];
+        $tempMarkersForCounting = $markers;
+        unset($tempMarkersForCounting['п.']);
+        unset($tempMarkersForCounting['п']);
+        unset($tempMarkersForCounting['г']);
 
+        while (true) {
+            $markerInfo = findMarkerInChunk($tempChunk, $tempMarkersForCounting, $ambiguousMarkers, $currentAddressParts);
+            if ($markerInfo === null) break;
+            
+            $markerInfo['real_pos'] = $offset + $markerInfo['pos'];
+            $markersInChunk[] = $markerInfo;
+            
+            $newOffset = $markerInfo['pos'] + mb_strlen($markerInfo['marker']);
+            $offset += $newOffset;
+            $tempChunk = mb_substr($tempChunk, $newOffset);
+            if (empty($tempChunk)) break;
+        }
+
+        if (count($markersInChunk) >= 3) {
+            $splitPos = $markersInChunk[1]['real_pos'];
+            $part1 = trim(mb_substr($chunk, 0, $splitPos));
+            $part2 = trim(mb_substr($chunk, $splitPos));
+            if ($part1 !== '' && $part2 !== '') {
+                array_unshift($processingQueue, $part2);
+                array_unshift($processingQueue, $part1);
+                continue;
+            }
+        }
+
+        $cleanComponent = removeLeadingNoise($chunk);
+        
         $markerInfo = findMarkerInChunk($cleanComponent, $markers, $ambiguousMarkers, $currentAddressParts);
         $pos = $markerInfo['pos'] ?? -1;
         if ($pos > 0) {
             $part1 = trim(mb_substr($cleanComponent, 0, $pos));
-            if ($markerInfo['level'] < LEVEL_STREET && isHouseComponent($part1, $markers)) {
+            if ($markerInfo['level'] < LEVEL_STREET && isHouseComponent($part1)) {
                 $part2 = trim(mb_substr($cleanComponent, $pos));
                 array_unshift($processingQueue, $part2);
                 array_unshift($processingQueue, $part1);
@@ -409,7 +404,7 @@ function splitAddresses(string $addressBlock): array
                 }
 
                 if (!$combined) {
-                    if (isset($currentAddressParts[LEVEL_CITY]) && $lastLevel >= LEVEL_CITY && !isHouseComponent($cleanComponent, $markers)) {
+                    if (isset($currentAddressParts[LEVEL_CITY]) && $lastLevel >= LEVEL_CITY && !isHouseComponent($cleanComponent)) {
                         $currentAddressParts[LEVEL_CITY] .= ', ' . $cleanComponent;
                         continue;
                     }
@@ -419,19 +414,27 @@ function splitAddresses(string $addressBlock): array
                     else if ($lastLevel === LEVEL_HOUSE && mb_strlen($cleanComponent) <= 2) {
                         $currentLevel = LEVEL_HOUSE;
                     }
-                    else if (isHouseComponent($cleanComponent, $markers)) {
+                    else if (isHouseComponent($cleanComponent)) {
                         $currentLevel = LEVEL_HOUSE;
                     } else {
-                        continue;
-                    }
+                        if (($lastLevel === LEVEL_REGION || $lastLevel === LEVEL_DISTRICT) && !containsDigits($cleanComponent) && !containsHouseKeyword($cleanComponent)) {
+                            $currentLevel = LEVEL_CITY;
+                        } else {
+                            continue;
+                        }
+                    }                    
                 }
             }
         }
-        
+
         if ($currentLevel === LEVEL_HOUSE) $foundAtLeastOneHouse = true;
 
         // --- 4. Принятие решения: новый адрес или часть текущего? ---
         $isNewAddress = ($lastLevel !== -1 && $currentLevel <= $lastLevel);
+        if ($isNewAddress && $currentLevel === LEVEL_CITY && $lastLevel === LEVEL_CITY) {
+            $isNewAddress = false;
+        }
+        
         $newHousePartFromHanging = null; 
 
         if ($isNewAddress && $currentLevel == LEVEL_HOUSE && $lastLevel == LEVEL_HOUSE) {
@@ -465,9 +468,7 @@ function splitAddresses(string $addressBlock): array
             $newParts = [];
             $cutOffLevel = $currentLevel;
 
-            if ($currentLevel == LEVEL_STREET
-                && isset($currentAddressParts[LEVEL_REGION])
-                && isset($currentAddressParts[LEVEL_CITY]))
+            if ($currentLevel == LEVEL_STREET && isset($currentAddressParts[LEVEL_REGION]) && isset($currentAddressParts[LEVEL_CITY]))
             {
                 $regionComponent = $currentAddressParts[LEVEL_REGION];
                 if (array_key_exists($regionComponent, $markerlessKeywords)) {
@@ -485,6 +486,7 @@ function splitAddresses(string $addressBlock): array
             $currentAddressParts = $newParts;
         }
 
+        // Добавляем текущий компонент в собираемый адрес.
         if ($newHousePartFromHanging !== null) {
             $currentAddressParts[LEVEL_HOUSE] = $newHousePartFromHanging;
             $lastHouseComponent = $newHousePartFromHanging;
@@ -492,12 +494,29 @@ function splitAddresses(string $addressBlock): array
             $currentAddressParts[LEVEL_HOUSE] .= ', ' . $cleanComponent;
             $lastHouseComponent = $currentAddressParts[LEVEL_HOUSE];
         } else {
+            if ($currentLevel === LEVEL_CITY && isset($currentAddressParts[LEVEL_CITY]) && !$isNewAddress) {
+                $currentAddressParts[LEVEL_CITY] .= ', ' . $cleanComponent;
+                $lastLevel = $currentLevel;
+                ksort($currentAddressParts);
+                continue;
+            }
+            
+            if (isset($currentAddressParts[$currentLevel])) {
+                $existingPart = $currentAddressParts[$currentLevel];
+                if (mb_stripos($cleanComponent, $existingPart) === 0) {
+                    $cleanComponent = trim(mb_substr($cleanComponent, mb_strlen($existingPart)));
+                }
+            }
+
             foreach($currentAddressParts as $lvl => $part) {
                 if ($lvl >= $currentLevel) unset($currentAddressParts[$lvl]);
             }
-            $currentAddressParts[$currentLevel] = $cleanComponent;
-            if ($currentLevel === LEVEL_HOUSE) {
-                $lastHouseComponent = $cleanComponent;
+            
+            if ($cleanComponent !== '') {
+                $currentAddressParts[$currentLevel] = $cleanComponent;
+                if ($currentLevel === LEVEL_HOUSE) {
+                    $lastHouseComponent = $cleanComponent;
+                }
             }
         }
 

@@ -1050,21 +1050,8 @@ function splitAddresses(string $addressBlock): array
         log_ai(">>>> FINAL ADDRESS BUILT: " . end($results));
     }
 
-    // Отфильтровываем "мусорные" строки, которые не являются адресами.
-    $finalResults = [];
-    foreach ($results as $address) {
-        $junkKeywords = ['объектами культурного наследия', 'технического состояния', 'Место выполнения работ'];
-        $isJunk = false;
-        foreach ($junkKeywords as $keyword) {
-            if (mb_stristr($address, $keyword)) {
-                $isJunk = true; break;
-            }
-        }
-        if (!$isJunk) $finalResults[] = $address;
-    }
-
     // Удаляем дубликаты, которые могли возникнуть из-за сложных пере-сборок.
-    $finalResults = array_unique($finalResults);
+    $finalResults = array_unique($results);
     $finalResults = array_values($finalResults);
 
     // --- 8. Финальная проверка и возврат результата ---

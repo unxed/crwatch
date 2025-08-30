@@ -826,7 +826,7 @@ function splitAddresses(string $addressBlock): array
             $currentAddressParts[LEVEL_HOUSE] = $newHousePartFromHanging;
             $lastHouseComponent = $newHousePartFromHanging;
         } else if ($currentLevel == LEVEL_HOUSE && isset($currentAddressParts[LEVEL_HOUSE]) && !$isNewAddress) {
-            $currentAddressParts[LEVEL_HOUSE] .= ', ' . $cleanComponent;
+            $currentAddressParts[LEVEL_HOUSE] .= ' ' . $cleanComponent;
             $lastHouseComponent = $currentAddressParts[LEVEL_HOUSE];
         } else {
 

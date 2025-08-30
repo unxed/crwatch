@@ -213,7 +213,7 @@ function containsLetters(string $str): bool
 }
 
 /**
- * Ищет первый валидный маркер в чанке.
+ * Ищет первый валидный маркер в чанке (стандартная логика) с одним специфичным исключением.
  * @param string $chunk Фрагмент адреса.
  * @param array $markers Список маркеров.
  * @param array $ambiguousMarkers Не используется (устарело).
@@ -222,6 +222,26 @@ function containsLetters(string $str): bool
  */
 function findMarkerInChunk(string $chunk, array $markers, array $ambiguousMarkers, array $currentAddressParts): ?array
 {
+    // --- НАЧАЛО СВЕРХ-СПЕЦИФИЧНОГО ПАТЧА ---
+    // Проверяем, не начинается ли чанк с явного маркера улицы.
+    // Это нужно, чтобы перехватить кейсы "ул. Название д. Номер" до того, как основной цикл найдет 'д.'
+    foreach ($markers as $marker => $level) {
+        if ($level === LEVEL_STREET) {
+            // mb_stripos === 0 проверяет, что маркер в самом начале
+            if (mb_stripos(trim($chunk), $marker) === 0) {
+                 $markerLen = mb_strlen($marker);
+                 $afterChar = ($markerLen < mb_strlen($chunk)) ? mb_substr($chunk, $markerLen, 1) : ' ';
+                 // Убедимся, что это целое слово
+                 if (in_array($afterChar, [' ', '.'])) {
+                     log_ai("Specific patch: Chunk starts with a street marker '{$marker}'. Prioritizing it.");
+                     return ['marker' => $marker, 'level' => LEVEL_STREET, 'pos' => 0];
+                 }
+            }
+        }
+    }
+    // --- КОНЕЦ ПАТЧА ---
+
+    // Основной, стандартный цикл поиска (как в самой первой рабочей версии)
     foreach ($markers as $marker => $level) {
         $pos = mb_stripos($chunk, $marker);
         if ($pos !== false) {
@@ -237,30 +257,19 @@ function findMarkerInChunk(string $chunk, array $markers, array $ambiguousMarker
                 }
             }
 
-            // Маркер должен быть отдельным словом
             if (in_array($before, [' ', '(']) && $isAfterOk) {
-
-                // Контекстная проверка для маркера "г" (город или литера Г)
-                if ($marker === 'г' || $marker === 'г.') {
-                    if ($pos > 0) {
-                        $chunkBeforeMarker = trim(mb_substr($chunk, 0, $pos));
-                        if (!empty($chunkBeforeMarker) && is_numeric(mb_substr($chunkBeforeMarker, -1))) {
-                            // Условие: перед маркером стоит цифра.
-                            // Теперь проверяем, что идет ПОСЛЕ, чтобы отличить "25 Г" от "30 г. Знаменск".
-                            $contentAfterMarker = trim(mb_substr($chunk, $pos + $markerLen));
-
-                            // Игнорируем маркер (считаем его литерой), только если после него НЕТ слова.
-                            // Пустая строка или одиночная буква - это не слово.
-                            if (empty($contentAfterMarker) || !containsLetters($contentAfterMarker)) {
-                                log_ai("Marker '{$marker}' is preceded by a digit and NOT followed by a word. Assuming it's a building letter. Ignoring.");
-                                continue; // Это литера, а не город, пропускаем
-                            }
+                if (($marker === 'г' || $marker === 'г.') && $pos > 0) {
+                    $chunkBeforeMarker = trim(mb_substr($chunk, 0, $pos));
+                    if (!empty($chunkBeforeMarker) && is_numeric(mb_substr($chunkBeforeMarker, -1))) {
+                        $contentAfterMarker = trim(mb_substr($chunk, $pos + $markerLen));
+                        if (empty($contentAfterMarker) || !containsLetters($contentAfterMarker)) {
+                            log_ai("Marker '{$marker}' is preceded by a digit and NOT followed by a word. Assuming it's a building letter. Ignoring.");
+                            continue;
                         }
                     }
                 }
 
-                // Контекстная проверка для "п." (поселок или пункт)
-                if ($marker === 'п.' || $marker === 'п') {
+                if (($marker === 'п.' || $marker === 'п')) {
                     $contentAfter = trim(mb_substr($chunk, $pos + $markerLen));
                     if (!empty($contentAfter) && is_numeric(mb_substr($contentAfter, 0, 1))) {
                         log_ai("Contextual 'п.': Marker is followed by a digit. Assuming 'пункт', not 'поселок'. Ignoring.");
@@ -269,9 +278,7 @@ function findMarkerInChunk(string $chunk, array $markers, array $ambiguousMarker
                 }
 
                 $currentLevel = $level;
-                // Контекстная проверка для "д." (дом или деревня)
                 if ($marker === 'д.') {
-                    // Считаем домом, если есть улица ИЛИ город, И в остатке есть цифры
                     $hasLocationContext = isset($currentAddressParts[LEVEL_STREET]) || isset($currentAddressParts[LEVEL_CITY]);
                     $chunkWithoutMarker = trim(str_ireplace('д.', '', $chunk));
                     if ($hasLocationContext && containsDigits($chunkWithoutMarker)) {
@@ -288,6 +295,7 @@ function findMarkerInChunk(string $chunk, array $markers, array $ambiguousMarker
     }
     return null;
 }
+
 
 /**
  * Проверяет, содержит ли строка ключевые слова для дополнений к дому (корпус, литера и т.д.).

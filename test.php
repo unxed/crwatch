@@ -705,6 +705,13 @@ function splitAddresses(string $addressBlock): array
 
         // --- 4. Принятие решения: новый адрес или часть текущего? ---
 
+        log_ai("--- DECISION POINT ---");
+        log_ai("CHUNK: '{$cleanComponent}'");
+        log_ai("CURRENT LEVEL: {$currentLevel}");
+        log_ai("LAST LEVEL: {$lastLevel}");
+        log_ai("CURRENT ADDRESS: " . implode(' | ', $currentAddressParts));
+        log_ai("LAST HOUSE COMPONENT: " . ($lastHouseComponent ?? 'null'));
+
         $isNewAddress = false; // По умолчанию, считаем, что это часть текущего адреса
 
         // ПРАВИЛО 1: Общее правило падения уровня иерархии
@@ -807,6 +814,8 @@ function splitAddresses(string $addressBlock): array
                 }
             }
             $currentAddressParts = $newParts;
+
+            log_ai("CONTEXT AFTER RESET: " . implode(' | ', $currentAddressParts));
         }
 
         // Добавляем текущий компонент в собираемый адрес.
@@ -866,6 +875,9 @@ function splitAddresses(string $addressBlock): array
                 }
             }
         }
+
+        log_ai("--- STATE AFTER ADDING COMPONENT ---");
+        log_ai("NEW CURRENT ADDRESS: " . implode(' | ', $currentAddressParts));
 
         $lastLevel = $currentLevel;
         ksort($currentAddressParts);

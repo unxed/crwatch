@@ -1,6 +1,7 @@
 <?php
 
 define("MAX_ITERATIONS", 4000); // Максимально допустимое количество итераций разбора адреса
+define("JUNK_CHUNK_LENGTH_THRESHOLD", 70); // Порог длины чанка, после которого он может считаться "мусором"
 
 require_once 'config.php';
 
@@ -20,11 +21,6 @@ const LEVEL_CITY = 3;
 const LEVEL_STREET = 4;
 const LEVEL_HOUSE = 5;
 
-// Определяем константу для порога "мусорного" чанка, если она еще не определена.
-if (!defined('JUNK_CHUNK_LENGTH_THRESHOLD')) {
-    define("JUNK_CHUNK_LENGTH_THRESHOLD", 70);
-}
-
 // --- ФУНКЦИИ-ПОМОЩНИКИ, НЕОБХОДИМЫЕ ДЛЯ РАБОТЫ ПАРСЕРА ---
 
 function isSingleWord(string $str): bool
@@ -40,16 +36,13 @@ function containsDigits(string $str): bool
 function findNumericListMarker(string $chunk): ?int
 {
     $len = mb_strlen($chunk);
-    // Начинаем с 1, так как маркер в самом начале обработает removeLeadingNoise.
     for ($i = 1; $i < $len; $i++) {
         if (mb_substr($chunk, $i, 1) === ')') {
             if (is_numeric(mb_substr($chunk, $i - 1, 1))) {
-                // Нашли "цифра)". Теперь найдем начало этой цифровой последовательности.
                 $startPos = $i - 1;
                 while ($startPos > 0 && is_numeric(mb_substr($chunk, $startPos - 1, 1))) {
                     $startPos--;
                 }
-                // Убедимся, что перед нумератором стоит пробел.
                 if ($startPos > 0 && mb_substr($chunk, $startPos - 1, 1) === ' ') {
                     return $startPos;
                 }
@@ -98,6 +91,25 @@ function containsLetters(string $str): bool
 
 function findMarkerInChunk(string $chunk, array $markers, array $ambiguousMarkers, array $currentAddressParts): ?array
 {
+    // --- НАЧАЛО СВЕРХ-СПЕЦИФИЧНОГО ПАТЧА ---
+    // Проверяем, не начинается ли чанк с явного маркера улицы.
+    // Это нужно, чтобы перехватить кейсы "ул. Название д. Номер" до того, как основной цикл найдет 'д.'
+    foreach ($markers as $marker => $level) {
+        if ($level === LEVEL_STREET) {
+            // mb_stripos === 0 проверяет, что маркер в самом начале
+            if (mb_stripos(trim($chunk), $marker) === 0) {
+                 $markerLen = mb_strlen($marker);
+                 $afterChar = ($markerLen < mb_strlen($chunk)) ? mb_substr($chunk, $markerLen, 1) : ' ';
+                 // Убедимся, что это целое слово
+                 if (in_array($afterChar, [' ', '.'])) {
+                     return ['marker' => $marker, 'level' => LEVEL_STREET, 'pos' => 0];
+                 }
+            }
+        }
+    }
+    // --- КОНЕЦ ПАТЧА ---
+
+    // Основной, стандартный цикл поиска
     foreach ($markers as $marker => $level) {
         $pos = mb_stripos($chunk, $marker);
         if ($pos !== false) {
@@ -113,24 +125,18 @@ function findMarkerInChunk(string $chunk, array $markers, array $ambiguousMarker
                 }
             }
 
-            // Маркер должен быть отдельным словом
             if (in_array($before, [' ', '(']) && $isAfterOk) {
-
-                // Контекстная проверка для маркера "г" (город или литера Г)
-                if ($marker === 'г' || $marker === 'г.') {
-                    if ($pos > 0) {
-                        $chunkBeforeMarker = trim(mb_substr($chunk, 0, $pos));
-                        if (!empty($chunkBeforeMarker) && is_numeric(mb_substr($chunkBeforeMarker, -1))) {
-                            $contentAfterMarker = trim(mb_substr($chunk, $pos + $markerLen));
-                            if (empty($contentAfterMarker) || !containsLetters($contentAfterMarker)) {
-                                continue; // Это литера, а не город, пропускаем
-                            }
+                if (($marker === 'г' || $marker === 'г.') && $pos > 0) {
+                    $chunkBeforeMarker = trim(mb_substr($chunk, 0, $pos));
+                    if (!empty($chunkBeforeMarker) && is_numeric(mb_substr($chunkBeforeMarker, -1))) {
+                        $contentAfterMarker = trim(mb_substr($chunk, $pos + $markerLen));
+                        if (empty($contentAfterMarker) || !containsLetters($contentAfterMarker)) {
+                            continue;
                         }
                     }
                 }
 
-                // Контекстная проверка для "п." (поселок или пункт)
-                if ($marker === 'п.' || $marker === 'п') {
+                if (($marker === 'п.' || $marker === 'п')) {
                     $contentAfter = trim(mb_substr($chunk, $pos + $markerLen));
                     if (!empty($contentAfter) && is_numeric(mb_substr($contentAfter, 0, 1))) {
                         continue;
@@ -138,7 +144,6 @@ function findMarkerInChunk(string $chunk, array $markers, array $ambiguousMarker
                 }
 
                 $currentLevel = $level;
-                // Контекстная проверка для "д." (дом или деревня)
                 if ($marker === 'д.') {
                     $hasLocationContext = isset($currentAddressParts[LEVEL_STREET]) || isset($currentAddressParts[LEVEL_CITY]);
                     $chunkWithoutMarker = trim(str_ireplace('д.', '', $chunk));
@@ -193,12 +198,55 @@ function isClearlyHouseComponent(string $component, array $markers): bool
 {
     foreach ($markers as $marker => $level) {
         if ($level === LEVEL_HOUSE) {
-            if (mb_stripos($component, $marker) !== false) {
-                return true;
+            $pos = mb_stripos($component, $marker);
+            if ($pos !== false) {
+                $before = ($pos > 0) ? mb_substr($component, $pos - 1, 1) : ' ';
+
+                $markerLen = mb_strlen($marker);
+                $isAfterOk = false;
+                if ($pos + $markerLen >= mb_strlen($component)) {
+                    $isAfterOk = true;
+                } else {
+                    $after = mb_substr($component, $pos + $markerLen, 1);
+                    if (in_array($after, [' ', '.', ')', '/']) || is_numeric($after)) {
+                        $isAfterOk = true;
+                    }
+                }
+
+                if (in_array($before, [' ', '(']) && $isAfterOk) {
+                    return true;
+                }
             }
         }
     }
     return false;
+}
+
+function isWordPartOfHouseComponent(string $word): bool
+{
+    $cleanWord = trim(mb_strtolower($word), '.,:');
+
+    if ($cleanWord === '') return true;
+
+    $houseKeywords = ['дом', 'д', 'литера', 'лит', 'корпус', 'корп', 'к', 'строение', 'стр'];
+    if (in_array($cleanWord, $houseKeywords)) {
+        return true;
+    }
+
+    if (containsDigits($cleanWord)) {
+        return true;
+    }
+
+    if (mb_strlen(preg_replace('/[^[:alpha:]]/u', '', $cleanWord)) === 1) {
+         return true;
+    }
+
+    return false;
+}
+
+function isPurelyNumeric(string $str): bool {
+    $cleanStr = trim($str);
+    return is_numeric(str_replace('/', '', $cleanStr));
 }
 
 function isJunkInput(array $chunks, array $markers, array $ambiguousMarkers): bool
@@ -213,23 +261,15 @@ function isJunkInput(array $chunks, array $markers, array $ambiguousMarkers): bo
     return false;
 }
 
-/**
- * Разделяет текстовый блок, содержащий один или несколько адресов, на массив отдельных адресов.
- * Функция спроектирована для работы с "грязными" данными без использования регулярных выражений и токенизации.
- * 
- * @param string $addressBlock Входная строка с одним или несколькими адресами.
- * @return array Массив извлеченных адресов. Если не удалось извлечь более одного адреса с указанием дома,
- *               возвращает массив, содержащий исходную строку.
- */
 function splitAddresses(string $addressBlock): array
 {
     // --- Конфигурация парсера ---
     $markersConfig = [
         'Российская Федерация' => LEVEL_COUNTRY,
         'обл' => LEVEL_REGION, 'область' => LEVEL_REGION, 'край' => LEVEL_REGION, 'Респ' => LEVEL_REGION, 'республика' => LEVEL_REGION, 'АО' => LEVEL_REGION,
-        'р-н' => LEVEL_DISTRICT, 'район' => LEVEL_DISTRICT, 'ГО:' => LEVEL_DISTRICT, 'МР:' => LEVEL_DISTRICT, 'округ' => LEVEL_DISTRICT,
+        'р-он' => LEVEL_DISTRICT, 'р-н' => LEVEL_DISTRICT, 'район' => LEVEL_DISTRICT, 'ГО:' => LEVEL_DISTRICT, 'МР:' => LEVEL_DISTRICT, 'округ' => LEVEL_DISTRICT,
         'г.' => LEVEL_CITY, 'г' => LEVEL_CITY, 'город' => LEVEL_CITY, 'с.' => LEVEL_CITY, 'село' => LEVEL_CITY, 'п.' => LEVEL_CITY, 'п' => LEVEL_CITY, 'пос.' => LEVEL_CITY, 'поселок' => LEVEL_CITY, 'рп.' => LEVEL_CITY, 'рп' => LEVEL_CITY, 'р. п.' => LEVEL_CITY, 'р.п.' => LEVEL_CITY, 'д.' => LEVEL_CITY,
-        'квл' => LEVEL_STREET, 'наб.кан.' => LEVEL_STREET, 'кан.' => LEVEL_STREET, 'ул.' => LEVEL_STREET, 'ул' => LEVEL_STREET, 'улица' => LEVEL_STREET, 'пр-т' => LEVEL_STREET, 'пр.' => LEVEL_STREET, 'просп' => LEVEL_STREET, 'просп.' => LEVEL_STREET, 'пр-кт' => LEVEL_STREET, 'проспект' => LEVEL_STREET, 'бул' => LEVEL_STREET, 'бул.' => LEVEL_STREET, 'б-р' => LEVEL_STREET, 'б-р.' => LEVEL_STREET, 'бульвар' => LEVEL_STREET, 'пер.' => LEVEL_STREET, 'переулок' => LEVEL_STREET, 'наб.' => LEVEL_STREET, 'набережная' => LEVEL_STREET, 'ш.' => LEVEL_STREET, 'шоссе' => LEVEL_STREET, 'пр-д' => LEVEL_STREET, 'проезд' => LEVEL_STREET, 'линия' => LEVEL_STREET, 'дорога' => LEVEL_STREET, 'мкр.' => LEVEL_STREET, 'мкр' => LEVEL_STREET, 'мкрн.' => LEVEL_STREET, 'мкрн' => LEVEL_STREET, 'микрорайон' => LEVEL_STREET,
+        'квл' => LEVEL_STREET, 'наб.кан.' => LEVEL_STREET, 'кан.' => LEVEL_STREET, 'ул.' => LEVEL_STREET, 'ул' => LEVEL_STREET, 'улица' => LEVEL_STREET, 'пр-т' => LEVEL_STREET, 'пр.' => LEVEL_STREET, 'просп' => LEVEL_STREET, 'просп.' => LEVEL_STREET, 'пр-кт' => LEVEL_STREET, 'проспект' => LEVEL_STREET, 'бул' => LEVEL_STREET, 'бул.' => LEVEL_STREET, 'б-р' => LEVEL_STREET, 'б-р.' => LEVEL_STREET, 'бульв' => LEVEL_STREET, 'бульв.' => LEVEL_STREET, 'бульвар' => LEVEL_STREET, 'пер.' => LEVEL_STREET, 'переулок' => LEVEL_STREET, 'наб.' => LEVEL_STREET, 'набережная' => LEVEL_STREET, 'ш.' => LEVEL_STREET, 'шоссе' => LEVEL_STREET, 'пр-д' => LEVEL_STREET, 'проезд' => LEVEL_STREET, 'линия' => LEVEL_STREET, 'дорога' => LEVEL_STREET, 'мкр.' => LEVEL_STREET, 'мкр' => LEVEL_STREET, 'мкрн.' => LEVEL_STREET, 'мкрн' => LEVEL_STREET, 'микрорайон' => LEVEL_STREET,
         'д.' => LEVEL_HOUSE, 'дом' => LEVEL_HOUSE, 'корп.' => LEVEL_HOUSE, 'корп' => LEVEL_HOUSE, 'к.' => LEVEL_HOUSE, 'корпус' => LEVEL_HOUSE, 'стр.' => LEVEL_HOUSE, 'строение' => LEVEL_HOUSE, 'литера' => LEVEL_HOUSE, 'лит.' => LEVEL_HOUSE,
     ];
     uksort($markersConfig, function ($a, $b) { return mb_strlen($b) - mb_strlen($a); });
@@ -278,12 +318,11 @@ function splitAddresses(string $addressBlock): array
         }
 
         $chunk = array_shift($processingQueue);
-        
+
         if (!empty($currentAddressParts)) {
             foreach ($currentAddressParts as $part) {
                 $part = trim($part);
                 $partLen = mb_strlen($part);
-                
                 if (mb_stripos($chunk, $part) === 0) {
                     $isWholeWordMatch = (mb_strlen($chunk) === $partLen) || (mb_substr($chunk, $partLen, 1) === ' ');
                     if ($isWholeWordMatch) {
@@ -333,13 +372,14 @@ function splitAddresses(string $addressBlock): array
         while (true) {
             $markerInfo = findMarkerInChunk($tempChunk, $tempMarkersForCounting, $ambiguousMarkers, $currentAddressParts);
             if ($markerInfo === null) break;
-            
+
             $markerInfo['real_pos'] = $offset + $markerInfo['pos'];
             $markersInChunk[] = $markerInfo;
-            
+
             $newOffset = $markerInfo['pos'] + mb_strlen($markerInfo['marker']);
             $offset += $newOffset;
             $tempChunk = mb_substr($tempChunk, $newOffset);
+
             if (empty($tempChunk)) break;
         }
 
@@ -355,12 +395,27 @@ function splitAddresses(string $addressBlock): array
         }
 
         $cleanComponent = removeLeadingNoise($chunk);
-        
+
         $markerInfo = findMarkerInChunk($cleanComponent, $markers, $ambiguousMarkers, $currentAddressParts);
         $pos = $markerInfo['pos'] ?? -1;
         if ($pos > 0) {
             $part1 = trim(mb_substr($cleanComponent, 0, $pos));
+            $shouldSplit = false;
+
             if ($markerInfo['level'] < LEVEL_STREET && isHouseComponent($part1)) {
+                $shouldSplit = true;
+            }
+            else if ($markerInfo['level'] === LEVEL_STREET && isClearlyHouseComponent($part1, $markers)) {
+                $shouldSplit = true;
+            }
+            else if ($markerInfo['level'] === LEVEL_STREET) {
+                $part1MarkerInfo = findMarkerInChunk($part1, $markers, $ambiguousMarkers, []);
+                if ($part1MarkerInfo !== null && $part1MarkerInfo['level'] <= LEVEL_CITY) {
+                     $shouldSplit = true;
+                }
+            }
+
+            if ($shouldSplit) {
                 $part2 = trim(mb_substr($cleanComponent, $pos));
                 array_unshift($processingQueue, $part2);
                 array_unshift($processingQueue, $part1);
@@ -422,7 +477,7 @@ function splitAddresses(string $addressBlock): array
                         } else {
                             continue;
                         }
-                    }                    
+                    }
                 }
             }
         }
@@ -430,28 +485,46 @@ function splitAddresses(string $addressBlock): array
         if ($currentLevel === LEVEL_HOUSE) $foundAtLeastOneHouse = true;
 
         // --- 4. Принятие решения: новый адрес или часть текущего? ---
-        $isNewAddress = ($lastLevel !== -1 && $currentLevel <= $lastLevel);
-        if ($isNewAddress && $currentLevel === LEVEL_CITY && $lastLevel === LEVEL_CITY) {
-            $isNewAddress = false;
-        }
-        
-        $newHousePartFromHanging = null; 
+        $isNewAddress = false;
 
-        if ($isNewAddress && $currentLevel == LEVEL_HOUSE && $lastLevel == LEVEL_HOUSE) {
-            $isSupplementToHouse = true;
-            $markerInfo = findMarkerInChunk($cleanComponent, $markers, $ambiguousMarkers, $currentAddressParts);
-            if ($markerInfo && in_array($markerInfo['marker'], ['д.', 'дом'])) {
-                $isSupplementToHouse = false;
-            }
-            if ($isSupplementToHouse) {
-                if (containsHouseKeyword($cleanComponent)) {
-                    $isNewAddress = false;
-                } else {
+        if ($lastLevel !== -1 && $currentLevel < $lastLevel) {
+            $isNewAddress = true;
+        } else if ($lastLevel !== -1 && $currentLevel === $lastLevel && !in_array($currentLevel, [LEVEL_HOUSE, LEVEL_CITY])) {
+             $isNewAddress = true;
+        }
+
+        if ($currentLevel === LEVEL_HOUSE && $lastLevel === LEVEL_HOUSE) {
+            if (mb_stripos($cleanComponent, 'д.') !== false || mb_stripos($cleanComponent, 'дом') !== false) {
+                $isNewAddress = true;
+            } else {
+                $lastHousePart = $currentAddressParts[LEVEL_HOUSE] ?? '';
+                $lastHouseWords = explode(' ', $lastHousePart);
+                $lastWordOfPrevHouse = trim(end($lastHouseWords));
+                $newHouseChunk = trim($cleanComponent);
+                $areSimilar = false;
+
+                if (mb_strlen($lastWordOfPrevHouse) === 1 && mb_strlen($newHouseChunk) === 1 &&
+                    preg_match('/^\p{L}$/u', $lastWordOfPrevHouse) && preg_match('/^\p{L}$/u', $newHouseChunk)) {
+                    $areSimilar = true;
+                }
+                else if (isPurelyNumeric($lastWordOfPrevHouse) && isPurelyNumeric($newHouseChunk)) {
+                    $areSimilar = true;
+                }
+
+                if ($areSimilar) {
+                    $isNewAddress = true;
                     if ($lastHouseComponent) {
-                         $newHousePartFromHanging = replaceLastWord($lastHouseComponent, $cleanComponent);
+                         $reconstructedChunk = replaceLastWord($lastHouseComponent, $newHouseChunk);
+                         $cleanComponent = $reconstructedChunk;
                     }
+                } else {
+                    $isNewAddress = false;
                 }
             }
+        }
+
+        if ($isNewAddress && $currentLevel === LEVEL_CITY && $lastLevel === LEVEL_CITY) {
+            $isNewAddress = false;
         }
 
         // --- 5. Сборка адреса ---
@@ -486,21 +559,30 @@ function splitAddresses(string $addressBlock): array
             $currentAddressParts = $newParts;
         }
 
-        // Добавляем текущий компонент в собираемый адрес.
-        if ($newHousePartFromHanging !== null) {
+        if ($newHousePartFromHanging ?? null) {
             $currentAddressParts[LEVEL_HOUSE] = $newHousePartFromHanging;
             $lastHouseComponent = $newHousePartFromHanging;
         } else if ($currentLevel == LEVEL_HOUSE && isset($currentAddressParts[LEVEL_HOUSE]) && !$isNewAddress) {
-            $currentAddressParts[LEVEL_HOUSE] .= ', ' . $cleanComponent;
+            $currentAddressParts[LEVEL_HOUSE] .= ' ' . $cleanComponent;
             $lastHouseComponent = $currentAddressParts[LEVEL_HOUSE];
         } else {
             if ($currentLevel === LEVEL_CITY && isset($currentAddressParts[LEVEL_CITY]) && !$isNewAddress) {
+                $existingCityClean = trim(str_replace(['г.', 'г', 'город'], '', $currentAddressParts[LEVEL_CITY]));
+                $newCityClean = trim(str_replace(['г.', 'г', 'город'], '', $cleanComponent));
+
+                if (mb_stripos($existingCityClean, $newCityClean) !== false || mb_stripos($newCityClean, $existingCityClean) !== false) {
+                    if (mb_strlen($cleanComponent) > mb_strlen($currentAddressParts[LEVEL_CITY])) {
+                        $currentAddressParts[LEVEL_CITY] = $cleanComponent;
+                    }
+                    continue;
+                }
+                
                 $currentAddressParts[LEVEL_CITY] .= ', ' . $cleanComponent;
                 $lastLevel = $currentLevel;
                 ksort($currentAddressParts);
                 continue;
             }
-            
+
             if (isset($currentAddressParts[$currentLevel])) {
                 $existingPart = $currentAddressParts[$currentLevel];
                 if (mb_stripos($cleanComponent, $existingPart) === 0) {
@@ -511,7 +593,7 @@ function splitAddresses(string $addressBlock): array
             foreach($currentAddressParts as $lvl => $part) {
                 if ($lvl >= $currentLevel) unset($currentAddressParts[$lvl]);
             }
-            
+
             if ($cleanComponent !== '') {
                 $currentAddressParts[$currentLevel] = $cleanComponent;
                 if ($currentLevel === LEVEL_HOUSE) {
@@ -535,40 +617,85 @@ function splitAddresses(string $addressBlock): array
                     break;
                 }
             }
- 
-            $streetComponent = $currentAddressParts[LEVEL_STREET];
-            $lastSpacePos = mb_strrpos($streetComponent, ' ');
 
-            if ($lastSpacePos !== false) {
-                $potentialHousePart = trim(mb_substr($streetComponent, $lastSpacePos + 1));
+            $streetSplitExceptions = ['квл', 'квартал', 'мкр', 'микрорайон', 'линия'];
+            $isException = false;
+            foreach ($streetSplitExceptions as $exception) {
+                if (mb_stripos($currentAddressParts[LEVEL_STREET], $exception) !== false) {
+                    $isException = true;
+                    break;
+                }
+            }
 
-                // Проверяем, что последняя часть начинается с цифры
-                if (is_numeric(mb_substr($potentialHousePart, 0, 1))) {
-                    $streetPart = trim(mb_substr($streetComponent, 0, $lastSpacePos));
-
-                    // Список исключений: маркеры улиц, которые ИСПОЛЬЗУЮТ номер как часть названия.
-                    // Для них отрывать номер нельзя.
-                    $numericStreetMarkers = ['квл', 'мкр', 'мкрн', 'микрорайон', 'линия'];
-
-                    // Отрываем номер дома, только если оставшаяся часть улицы не является исключением.
-                    if (!empty($streetPart) && !in_array(mb_strtolower($streetPart), $numericStreetMarkers)) {
+            if (!$isException) {
+                $streetComponent = $currentAddressParts[LEVEL_STREET];
+                $splitPos = -1;
+                for ($i = mb_strlen($streetComponent) - 1; $i > 0; $i--) {
+                    $char = mb_substr($streetComponent, $i, 1);
+                    $prev_char = mb_substr($streetComponent, $i - 1, 1);
+                    if (is_numeric($char) && $prev_char === ' ') {
+                        $splitPos = $i;
+                        $partBefore = trim(mb_substr($streetComponent, 0, $splitPos));
+                        if (mb_strpos($partBefore, ' ') === false) {
+                            $splitPos = -1;
+                        }
+                        break;
+                    }
+                }
+                if ($splitPos !== -1) {
+                    $streetPart = trim(mb_substr($streetComponent, 0, $splitPos));
+                    $potentialHousePart = trim(mb_substr($streetComponent, $splitPos));
+                    if (!empty($streetPart) && !empty($potentialHousePart)) {
                         $currentAddressParts[LEVEL_STREET] = $streetPart;
                         array_unshift($processingQueue, $potentialHousePart);
                     }
                 }
             }
-        
-        } else if ($currentLevel === LEVEL_HOUSE) {
-            $streetMarkersForSplit = [' ул.', ' ул ', ' пр-т', ' пр ', ' б-р', ' пер '];
-             foreach ($streetMarkersForSplit as $streetMarker) {
-                $streetPos = mb_stripos($currentAddressParts[LEVEL_HOUSE], $streetMarker);
-                if ($streetPos !== false) {
-                    $housePart = trim(mb_substr($currentAddressParts[LEVEL_HOUSE], 0, $streetPos));
-                    $streetPart = trim(mb_substr($currentAddressParts[LEVEL_HOUSE], $streetPos));
-                    $currentAddressParts[LEVEL_HOUSE] = $housePart;
-                    array_unshift($processingQueue, $streetPart);
-                    $lastLevel = LEVEL_HOUSE;
-                    break;
+        } else if ($currentLevel === LEVEL_HOUSE && isset($currentAddressParts[LEVEL_HOUSE])) {
+            $componentText = $currentAddressParts[LEVEL_HOUSE];
+            $streetMarkers = [];
+            foreach ($markers as $marker => $level) if ($level === LEVEL_STREET) $streetMarkers[] = $marker;
+
+            $bestStreetPos = -1;
+            foreach ($streetMarkers as $streetMarker) {
+                $pos = mb_stripos($componentText, ' ' . trim($streetMarker));
+                if ($pos !== false && ($bestStreetPos === -1 || $pos < $bestStreetPos)) $bestStreetPos = $pos;
+            }
+
+            if ($bestStreetPos !== -1) {
+                $words = explode(' ', $componentText);
+                $splitIndex = -1;
+                for ($i = count($words) - 1; $i >= 0; $i--) {
+                    if (!isWordPartOfHouseComponent($words[$i])) {
+                        $splitIndex = $i;
+                    } else if ($splitIndex !== -1) {
+                        break;
+                    }
+                }
+
+                if ($splitIndex !== -1) {
+                    $houseWords = array_slice($words, 0, $splitIndex);
+                    $streetWords = array_slice($words, $splitIndex);
+                    $housePart = trim(implode(' ', $houseWords));
+                    $streetPart = trim(implode(' ', $streetWords));
+                    $contextStreet = $currentAddressParts[LEVEL_STREET] ?? null;
+
+                    $cleanContextStreet = str_replace(['.',' '], '', mb_strtolower($contextStreet));
+                    $cleanStreetPart = str_replace(['.',' '], '', mb_strtolower($streetPart));
+
+                    if ($contextStreet && (mb_strpos($cleanContextStreet, $cleanStreetPart) !== false || mb_strpos($cleanStreetPart, $cleanContextStreet) !== false)) {
+                        $currentAddressParts[LEVEL_HOUSE] = $housePart;
+                        $lastHouseComponent = $housePart;
+                    }
+                    else {
+                        unset($currentAddressParts[LEVEL_HOUSE]);
+                        array_unshift($processingQueue, $streetPart);
+                        if (!empty($housePart)) {
+                             array_unshift($processingQueue, $housePart);
+                        }
+                        $lastLevel = -1;
+                        continue;
+                    }
                 }
             }
         }
@@ -584,7 +711,8 @@ function splitAddresses(string $addressBlock): array
         $results[] = implode(', ', $currentAddressParts);
     }
 
-    $finalResults = [];
+    // Применяем фильтр для "мусорных" ключевых слов, специфичный для миграции
+    $filteredResults = [];
     foreach ($results as $address) {
         $junkKeywords = ['объектами культурного наследия', 'технического состояния', 'Место выполнения работ'];
         $isJunk = false;
@@ -593,10 +721,10 @@ function splitAddresses(string $addressBlock): array
                 $isJunk = true; break;
             }
         }
-        if (!$isJunk) $finalResults[] = $address;
+        if (!$isJunk) $filteredResults[] = $address;
     }
 
-    $finalResults = array_unique($finalResults);
+    $finalResults = array_unique($filteredResults);
     $finalResults = array_values($finalResults);
 
     // --- 8. Финальная проверка и возврат результата ---

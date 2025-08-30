@@ -344,23 +344,45 @@ function isHouseComponent(string $component): bool
 }
 
 /**
- * Более строгая проверка, является ли чанк компонентом дома.
+ * Проверка, является ли чанк компонентом дома.
  * Используется в lookahead, чтобы избежать ложных срабатываний.
+ * Версия 2.0: Добавлена проверка на "целое слово", чтобы не находить маркеры внутри других слов (например, 'к.' в 'Михайловск').
  * @param string $component Фрагмент для проверки.
  * @param array $markers Список маркеров.
- * @return bool True, если в чанке есть явный маркер дома ('д.', 'корп.' и т.д.).
+ * @return bool True, если в чанке есть явный маркер дома ('д.', 'корп.' и т.д.), который является отдельным словом.
  */
 function isClearlyHouseComponent(string $component, array $markers): bool
 {
     foreach ($markers as $marker => $level) {
         if ($level === LEVEL_HOUSE) {
-            // Используем mb_stripos для простой проверки наличия
-            if (mb_stripos($component, $marker) !== false) {
-                return true;
+            $pos = mb_stripos($component, $marker);
+            if ($pos !== false) {
+                // ПРОВЕРКА НА ЦЕЛОЕ СЛОВО (аналогично findMarkerInChunk)
+
+                // 1. Проверяем символ ПЕРЕД маркером
+                $before = ($pos > 0) ? mb_substr($component, $pos - 1, 1) : ' ';
+
+                // 2. Проверяем символ ПОСЛЕ маркера
+                $markerLen = mb_strlen($marker);
+                $isAfterOk = false;
+                if ($pos + $markerLen >= mb_strlen($component)) {
+                    $isAfterOk = true; // Маркер в самом конце строки
+                } else {
+                    $after = mb_substr($component, $pos + $markerLen, 1);
+                    // После маркера должен быть пробел, пунктуация или цифра
+                    if (in_array($after, [' ', '.', ')', '/']) || is_numeric($after)) {
+                        $isAfterOk = true;
+                    }
+                }
+
+                // 3. Если оба условия выполнены, это валидный маркер
+                if (in_array($before, [' ', '(']) && $isAfterOk) {
+                    return true; // Нашли валидный, "чистый" маркер дома
+                }
             }
         }
     }
-    return false;
+    return false; // Не нашли явных маркеров дома, являющихся отдельными словами
 }
 
 /**
@@ -438,7 +460,7 @@ function splitAddresses(string $addressBlock): array
         'обл' => LEVEL_REGION, 'область' => LEVEL_REGION, 'край' => LEVEL_REGION, 'Респ' => LEVEL_REGION, 'республика' => LEVEL_REGION, 'АО' => LEVEL_REGION,
         'р-он' => LEVEL_DISTRICT, 'р-н' => LEVEL_DISTRICT, 'район' => LEVEL_DISTRICT, 'ГО:' => LEVEL_DISTRICT, 'МР:' => LEVEL_DISTRICT, 'округ' => LEVEL_DISTRICT,
         'г.' => LEVEL_CITY, 'г' => LEVEL_CITY, 'город' => LEVEL_CITY, 'с.' => LEVEL_CITY, 'село' => LEVEL_CITY, 'п.' => LEVEL_CITY, 'п' => LEVEL_CITY, 'пос.' => LEVEL_CITY, 'поселок' => LEVEL_CITY, 'рп.' => LEVEL_CITY, 'рп' => LEVEL_CITY, 'р. п.' => LEVEL_CITY, 'р.п.' => LEVEL_CITY, 'д.' => LEVEL_CITY,
-        'квл' => LEVEL_STREET, 'наб.кан.' => LEVEL_STREET, 'кан.' => LEVEL_STREET, 'ул.' => LEVEL_STREET, 'ул' => LEVEL_STREET, 'улица' => LEVEL_STREET, 'пр-т' => LEVEL_STREET, 'пр.' => LEVEL_STREET, 'просп' => LEVEL_STREET, 'просп.' => LEVEL_STREET, 'пр-кт' => LEVEL_STREET, 'проспект' => LEVEL_STREET, 'бул' => LEVEL_STREET, 'бул.' => LEVEL_STREET, 'б-р' => LEVEL_STREET, 'б-р.' => LEVEL_STREET, 'бульвар' => LEVEL_STREET, 'пер.' => LEVEL_STREET, 'переулок' => LEVEL_STREET, 'наб.' => LEVEL_STREET, 'набережная' => LEVEL_STREET, 'ш.' => LEVEL_STREET, 'шоссе' => LEVEL_STREET, 'пр-д' => LEVEL_STREET, 'проезд' => LEVEL_STREET, 'линия' => LEVEL_STREET, 'дорога' => LEVEL_STREET, 'мкр.' => LEVEL_STREET, 'мкр' => LEVEL_STREET, 'мкрн.' => LEVEL_STREET, 'мкрн' => LEVEL_STREET, 'микрорайон' => LEVEL_STREET,
+        'квл' => LEVEL_STREET, 'наб.кан.' => LEVEL_STREET, 'кан.' => LEVEL_STREET, 'ул.' => LEVEL_STREET, 'ул' => LEVEL_STREET, 'улица' => LEVEL_STREET, 'пр-т' => LEVEL_STREET, 'пр.' => LEVEL_STREET, 'просп' => LEVEL_STREET, 'просп.' => LEVEL_STREET, 'пр-кт' => LEVEL_STREET, 'проспект' => LEVEL_STREET, 'бул' => LEVEL_STREET, 'бул.' => LEVEL_STREET, 'б-р' => LEVEL_STREET, 'б-р.' => LEVEL_STREET, 'бульв' => LEVEL_STREET, 'бульв.' => LEVEL_STREET, 'бульвар' => LEVEL_STREET, 'пер.' => LEVEL_STREET, 'переулок' => LEVEL_STREET, 'наб.' => LEVEL_STREET, 'набережная' => LEVEL_STREET, 'ш.' => LEVEL_STREET, 'шоссе' => LEVEL_STREET, 'пр-д' => LEVEL_STREET, 'проезд' => LEVEL_STREET, 'линия' => LEVEL_STREET, 'дорога' => LEVEL_STREET, 'мкр.' => LEVEL_STREET, 'мкр' => LEVEL_STREET, 'мкрн.' => LEVEL_STREET, 'мкрн' => LEVEL_STREET, 'микрорайон' => LEVEL_STREET,
         'д.' => LEVEL_HOUSE, 'дом' => LEVEL_HOUSE, 'корп.' => LEVEL_HOUSE, 'корп' => LEVEL_HOUSE, 'к.' => LEVEL_HOUSE, 'корпус' => LEVEL_HOUSE, 'стр.' => LEVEL_HOUSE, 'строение' => LEVEL_HOUSE, 'литера' => LEVEL_HOUSE, 'лит.' => LEVEL_HOUSE,
     ];
     uksort($markersConfig, function ($a, $b) { return mb_strlen($b) - mb_strlen($a); });
@@ -1008,8 +1030,8 @@ function splitAddresses(string $addressBlock): array
                     $contextStreet = $currentAddressParts[LEVEL_STREET] ?? null;
 
                     // Сравниваем улицы, игнорируя пунктуацию и регистр
-                    $cleanContextStreet = str_replace(['.',' '], '', mb_strtolower($contextStreet));
-                    $cleanStreetPart = str_replace(['.',' '], '', mb_strtolower($streetPart));
+                    $cleanContextStreet = str_replace(['.',' '], '', mb_strtolower($contextStreet ?? ''));
+                    $cleanStreetPart = str_replace(['.',' '], '', mb_strtolower($streetPart ?? ''));
 
                     // Если улицы СОВПАДАЮТ -> это избыточный дубликат
                     if ($contextStreet && (mb_strpos($cleanContextStreet, $cleanStreetPart) !== false || mb_strpos($cleanStreetPart, $cleanContextStreet) !== false)) {

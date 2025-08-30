@@ -808,6 +808,8 @@ function splitAddresses(string $addressBlock): array
                  $cutOffLevel = LEVEL_HOUSE; // Для висячего дома сохраняем все, что < LEVEL_HOUSE
             }
 
+            log_ai("CONTEXT RESET DECISION: Preserving levels < {$cutOffLevel}");
+
             foreach ($currentAddressParts as $lvl => $part) {
                 if ($lvl < $cutOffLevel) {
                     $newParts[$lvl] = $part;
@@ -956,6 +958,12 @@ function splitAddresses(string $addressBlock): array
             // --- Конец блок для "отщепления" дома без маркера ---
 
         } else if ($currentLevel === LEVEL_HOUSE && isset($currentAddressParts[LEVEL_HOUSE])) {
+
+            log_ai("--- Post-split check for HOUSE component ---");
+            log_ai("Analyzing component: '{$currentAddressParts[LEVEL_HOUSE]}'");
+            $contextStreetForDebug = $currentAddressParts[LEVEL_STREET] ?? '[NONE]';
+            log_ai("Context street is: '{$contextStreetForDebug}'");
+            
             $componentText = $currentAddressParts[LEVEL_HOUSE];
 
             // --- ЭТАП 1: Поиск наиболее раннего маркера улицы внутри компонента дома ---
@@ -996,6 +1004,7 @@ function splitAddresses(string $addressBlock): array
 
                     // Если улицы СОВПАДАЮТ -> это избыточный дубликат
                     if ($contextStreet && (mb_strpos($cleanContextStreet, $cleanStreetPart) !== false || mb_strpos($cleanStreetPart, $cleanContextStreet) !== false)) {
+                        log_ai("  DECISION: Streets match. Removing redundant part '{$streetPart}' from house component.");
                         log_ai("Post-split: Found and removed redundant street phrase '{$streetPart}'.");
                         $currentAddressParts[LEVEL_HOUSE] = $housePart; // Просто чистим компонент дома
                         $lastHouseComponent = $housePart;
@@ -1003,6 +1012,7 @@ function splitAddresses(string $addressBlock): array
                     }
                     // Если улицы РАЗНЫЕ -> это начало нового адреса
                     else {
+                        log_ai("  DECISION: Streets differ or no context street. Re-queuing house='{$housePart}', street='{$streetPart}'.");
                         log_ai("Post-split: Found new address part '{$streetPart}'. Re-queuing.");
                         unset($currentAddressParts[LEVEL_HOUSE]);
                         array_unshift($processingQueue, $streetPart);
